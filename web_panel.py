@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import re
 import json
 import time
 import uuid
@@ -33,6 +34,11 @@ DEFAULT_GROUP_TITLE_TEMPLATE = "{TARGET}"
 # 11 lines matching the exact line count and blank-line gaps of the original BASE_TEMPLATE:
 # 5 blank lines after lines 1, 2, 3; 6 blank lines after lines 4..10; no trailing blank lines after line 11.
 LINE_GAPS_AFTER = [6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 1]
+
+EMOJI_POOL = [
+    "🌒", "⚡", "🌀", "🪷", "🌱", "😂", "🤣", "🥳",
+    "❄️", "☔", "🌈", "🔥", "💀", "🤡", "😈", "👻",
+]
 
 MAX_RETRIES = 5
 
@@ -180,11 +186,21 @@ def reset_active_template():
                 pass
 
 
+def render_single_line_with_random_emoji(base_line: str, target_name: str) -> str:
+    chosen_emoji = random.choice(EMOJI_POOL)
+    rendered = base_line.replace("{TARGET}", target_name).replace("{EMOJI}", chosen_emoji)
+    if "-🌒-" in rendered:
+        return rendered.replace("-🌒-", f"-{chosen_emoji}-")
+    # If user customized the single line and kept a trailing `-<token>-` marker, swap its inner token per line
+    if re.search(r"-[^\s-]+-\s*$", rendered):
+        return re.sub(r"-[^\s-]+-(\s*)$", f"-{chosen_emoji}-\\1", rendered)
+    return f"{rendered} -{chosen_emoji}-"
+
+
 def build_expanded_message(single_line_template: str, target_name: str) -> str:
-    line_content = single_line_template.replace("{TARGET}", target_name)
     parts = []
     for idx, newlines_after in enumerate(LINE_GAPS_AFTER):
-        parts.append(line_content)
+        parts.append(render_single_line_with_random_emoji(single_line_template, target_name))
         if idx < len(LINE_GAPS_AFTER) - 1:
             parts.append("\n" * newlines_after)
     return "".join(parts)
@@ -304,8 +320,25 @@ def next_delay(speed_mode: str, slow_band: tuple[float, float]) -> float:
     return random.uniform(slow_band[0], slow_band[1])
 
 
+def apply_group_names_once(task_id: str, cl: Client, thread_ids: list[str], target_name: str):
+    title_tpl = get_active_group_title_template()
+    new_title = title_tpl.replace("{TARGET}", target_name).strip()[:75]
+    if not new_title:
+        return
+    for tid_str in thread_ids:
+        if not is_task_running(task_id):
+            break
+        try:
+            cl.direct_thread_update_title(int(tid_str), new_title)
+            log_task(task_id, f"NC updated {tid_str} -> {new_title[:28]}")
+        except Exception as exc:
+            log_task(task_id, f"NC skip/err {tid_str}: {str(exc)[:35]}")
+
+
 def group_rename_loop(task_id: str, cl: Client, thread_ids: list[str], target_name: str):
-    """Renames group threads every 10-20 minutes (600-1200s)."""
+    """Changes group name immediately on start, then every 10-20 minutes (600-1200s)."""
+    apply_group_names_once(task_id, cl, thread_ids, target_name)
+
     while is_task_running(task_id):
         interval = random.uniform(600, 1200)
         slept = 0.0
@@ -317,19 +350,7 @@ def group_rename_loop(task_id: str, cl: Client, thread_ids: list[str], target_na
         if not is_task_running(task_id):
             break
 
-        title_tpl = get_active_group_title_template()
-        new_title = title_tpl.replace("{TARGET}", target_name).strip()[:75]
-        if not new_title:
-            continue
-
-        for tid_str in thread_ids:
-            if not is_task_running(task_id):
-                break
-            try:
-                cl.direct_thread_update_title(int(tid_str), new_title)
-                log_task(task_id, f"Renamed group {tid_str} -> {new_title[:28]}")
-            except Exception as exc:
-                log_task(task_id, f"Rename skip/err {tid_str}: {str(exc)[:35]}")
+        apply_group_names_once(task_id, cl, thread_ids, target_name)
 
 
 def worker_loop(task_id: str):
@@ -342,16 +363,17 @@ def worker_loop(task_id: str):
         thread_ids = list(task["thread_ids"])
         target_name = task["target_name"]
         speed_mode = task.get("speed_mode", "slow")
+        use_nc = bool(task.get("use_nc", True))
 
-    renamer = threading.Thread(
-        target=group_rename_loop,
-        args=(task_id, cl, thread_ids, target_name),
-        daemon=True,
-    )
-    renamer.start()
+    if use_nc:
+        renamer = threading.Thread(
+            target=group_rename_loop,
+            args=(task_id, cl, thread_ids, target_name),
+            daemon=True,
+        )
+        renamer.start()
 
     single_line_tpl = get_active_single_line_template()
-    expanded_msg = build_expanded_message(single_line_tpl, target_name)
 
     slow_band = generate_slow_band()
     last_band_change = time.time()
@@ -361,11 +383,13 @@ def worker_loop(task_id: str):
     while is_task_running(task_id):
         try:
             round_num += 1
-            log_task(task_id, f"Round {round_num} started ({speed_mode})")
+            nc_label = "NC:ON" if use_nc else "NC:OFF"
+            log_task(task_id, f"Round {round_num} started ({speed_mode}, {nc_label})")
             for tid_str in thread_ids:
                 if not is_task_running(task_id):
                     break
 
+                expanded_msg = build_expanded_message(single_line_tpl, target_name)
                 num = random.randint(1, 10**10)
                 payload = (
                     f"{num}\n\n{expanded_msg}"
@@ -430,6 +454,7 @@ class StartTaskReq(BaseModel):
     thread_ids: list[str]
     target_name: str
     speed_mode: Optional[str] = "slow"
+    use_nc: Optional[bool] = True
 
 
 class TemplateReq(BaseModel):
@@ -454,6 +479,7 @@ def api_state(x_panel_token: Optional[str] = Header(default=None), token: Option
                 "target_name": info.get("target_name"),
                 "thread_ids": [str(x) for x in info.get("thread_ids", [])],
                 "speed_mode": info.get("speed_mode", "slow"),
+                "use_nc": bool(info.get("use_nc", True)),
                 "running": info.get("running"),
                 "msg_count": info.get("msg_count", 0),
                 "last_event": info.get("last_event", ""),
@@ -581,6 +607,7 @@ def api_start_task(
     target = body.target_name.strip()
     tids = parse_thread_ids(body.thread_ids)
     speed = (body.speed_mode or "slow").strip().lower()
+    use_nc = bool(True if body.use_nc is None else body.use_nc)
     if speed not in ("slow", "fast"):
         raise HTTPException(status_code=400, detail="speed_mode must be 'slow' or 'fast'.")
 
@@ -600,14 +627,15 @@ def api_start_task(
             "thread_ids": tids,
             "target_name": target,
             "speed_mode": speed,
+            "use_nc": use_nc,
             "running": True,
             "msg_count": 0,
-            "last_event": "Queued (group rename every 10-20m)",
+            "last_event": "Queued (NC immediate + 10-20m)" if use_nc else "Queued (Without NC)",
             "last_update": datetime.now().strftime("%H:%M:%S"),
         }
 
     threading.Thread(target=worker_loop, args=(task_id,), daemon=True).start()
-    return {"ok": True, "task_id": task_id, "speed_mode": speed, "thread_ids": tids}
+    return {"ok": True, "task_id": task_id, "speed_mode": speed, "use_nc": use_nc, "thread_ids": tids}
 
 
 @app.post("/api/tasks/{task_id}/stop")
@@ -710,6 +738,7 @@ HTML_PAGE = """<!DOCTYPE html>
     .on { background: rgba(34,197,94,0.16); color: var(--green); }
     .off { background: rgba(239,68,68,0.16); color: var(--red); }
     .speed-badge { background: rgba(59,130,246,0.16); color: #93c5fd; }
+    .nc-badge { background: rgba(245,158,11,0.16); color: #fcd34d; }
     .muted { color: var(--muted); font-size: 0.85rem; }
     .list-item { border-top: 1px solid var(--border); padding: 10px 0; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
     .list-item:first-child { border-top: 0; }
@@ -775,7 +804,12 @@ HTML_PAGE = """<!DOCTYPE html>
           <option value="fast">Fast (10–20s delay)</option>
         </select>
 
-        <div class="muted" style="margin-top:8px;">Group title automatically updates every 10–20 minutes using the Group Title template.</div>
+        <label>Name Change (NC) Mode</label>
+        <select id="ncMode">
+          <option value="true" selected>Run with NC (instant + every 10–20m)</option>
+          <option value="false">Run without NC</option>
+        </select>
+
         <div class="row"><button onclick="startTask()">Start Task</button></div>
       </div>
     </div>
@@ -788,11 +822,11 @@ HTML_PAGE = """<!DOCTYPE html>
 
       <div class="card">
         <h2>4. Message & Group Rename Templates</h2>
-        <div class="muted">Enter <strong>one line</strong> using <code>{TARGET}</code>. Expands into 11 lines with original gaps.</div>
+        <div class="muted">Enter <strong>one line</strong> using <code>{TARGET}</code>. Picks a random emoji for <code>-🌒-</code> on each of the 11 lines.</div>
         <label>Single Line Message Template</label>
         <input id="templateLineInput" type="text" placeholder="<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> -🌒-" />
 
-        <label>Group Name Template (every 10–20 mins, uses <code>{TARGET}</code>)</label>
+        <label>Group Name Template (when NC is ON, uses <code>{TARGET}</code>)</label>
         <input id="groupTitleInput" type="text" placeholder="{TARGET}" />
 
         <div class="row">
@@ -929,6 +963,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 <div><strong>${escapeHtml(t.task_id)}</strong> · @${escapeHtml(t.username)} → <strong>${escapeHtml(t.target_name)}</strong>
                   <span class="badge ${t.running ? "on" : "off"}">${t.running ? "RUNNING" : "STOPPED"}</span>
                   <span class="badge speed-badge">${escapeHtml((t.speed_mode || "slow").toUpperCase())}</span>
+                  <span class="badge nc-badge">${t.use_nc !== false ? "WITH NC" : "NO NC"}</span>
                 </div>
                 <div class="muted">Sent: ${t.msg_count} · ${escapeHtml(t.last_event || "Idle")} (${escapeHtml(t.last_update || "")})</div>
               </div>
@@ -1007,9 +1042,10 @@ HTML_PAGE = """<!DOCTYPE html>
         const username = document.getElementById("taskAccount").value;
         const target_name = document.getElementById("targetInput").value.trim();
         const speed_mode = document.getElementById("speedMode").value;
+        const use_nc = document.getElementById("ncMode").value === "true";
         const thread_ids = getSelectedThreadStrings();
-        const { data } = await api("/api/tasks/start", "POST", { username, thread_ids, target_name, speed_mode });
-        showToast(`Started task ${data.task_id} (${data.speed_mode})`);
+        const { data } = await api("/api/tasks/start", "POST", { username, thread_ids, target_name, speed_mode, use_nc });
+        showToast(`Started task ${data.task_id} (${data.speed_mode}, ${data.use_nc ? "with NC" : "no NC"})`);
         refreshState();
       } catch (e) { showToast(e.message, true); }
     }
