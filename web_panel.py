@@ -28,75 +28,11 @@ os.makedirs(DATA_DIR, exist_ok=True)
 ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
 TEMPLATE_FILE = os.path.join(DATA_DIR, "template.json")
 
-BASE_TEMPLATE = """<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> -⚡-
-
-
-
-
-
-<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> -🌀-
-
-
-
-
-
-<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> -🪷-
-
-
-
-
-
-
-<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> -🌱-
-
-
-
-
-
-
-<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> -😂-
-
-
-
-
-
-
-<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> -🤣-
-
-
-
-
-
-
-<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> -🥳-
-
-
-
-
-
-
-<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> -❄️-
-
-
-
-
-
-
-<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> -☔-
-
-
-
-
-
-
-<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> -🌈-
-
-
-
-
-
-
-<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> -🌒-"""
+DEFAULT_SINGLE_LINE_TEMPLATE = "<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> -🌒-"
+DEFAULT_GROUP_TITLE_TEMPLATE = "{TARGET}"
+# 11 lines matching the exact line count and blank-line gaps of the original BASE_TEMPLATE:
+# 5 blank lines after lines 1, 2, 3; 6 blank lines after lines 4..10; no trailing blank lines after line 11.
+LINE_GAPS_AFTER = [6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 1]
 
 MAX_RETRIES = 5
 
@@ -150,7 +86,7 @@ def register_saved_account(username: str, ig_user_id=None, auth_method: str = "s
         prev = accounts.get(username, {})
         accounts[username] = {
             "username": username,
-            "ig_user_id": ig_user_id or prev.get("ig_user_id"),
+            "ig_user_id": str(ig_user_id) if ig_user_id is not None else prev.get("ig_user_id"),
             "auth_method": auth_method,
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
@@ -179,25 +115,57 @@ def delete_saved_account(username: str):
     client_cache.pop(username, None)
 
 
-def get_active_template() -> str:
-    with store_lock:
-        if os.path.exists(TEMPLATE_FILE):
-            try:
-                with open(TEMPLATE_FILE, "r", encoding="utf-8") as f:
-                    payload = json.load(f)
-                tpl = payload.get("template")
-                if isinstance(tpl, str) and tpl.strip():
-                    return tpl
-            except Exception:
-                pass
-        return BASE_TEMPLATE
+def _read_template_payload() -> dict:
+    if os.path.exists(TEMPLATE_FILE):
+        try:
+            with open(TEMPLATE_FILE, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+    return {}
 
 
-def set_active_template(tpl: str):
+def get_active_single_line_template() -> str:
     with store_lock:
+        payload = _read_template_payload()
+        tpl = payload.get("template")
+        if isinstance(tpl, str) and tpl.strip():
+            lines = [ln.strip() for ln in tpl.splitlines() if ln.strip()]
+            if lines:
+                return lines[0]
+        return DEFAULT_SINGLE_LINE_TEMPLATE
+
+
+def get_active_group_title_template() -> str:
+    with store_lock:
+        payload = _read_template_payload()
+        gt = payload.get("group_title_template")
+        if isinstance(gt, str) and gt.strip():
+            return gt.strip()
+        return DEFAULT_GROUP_TITLE_TEMPLATE
+
+
+def set_active_template(tpl: str, group_title_template: Optional[str] = None):
+    lines = [ln.strip() for ln in tpl.splitlines() if ln.strip()]
+    if not lines:
+        raise ValueError("Template cannot be empty.")
+    single_line = lines[0]
+    with store_lock:
+        existing = _read_template_payload()
+        gt = (
+            group_title_template.strip()
+            if isinstance(group_title_template, str) and group_title_template.strip()
+            else existing.get("group_title_template") or DEFAULT_GROUP_TITLE_TEMPLATE
+        )
         with open(TEMPLATE_FILE, "w", encoding="utf-8") as f:
             json.dump(
-                {"template": tpl, "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+                {
+                    "template": single_line,
+                    "group_title_template": gt,
+                    "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                },
                 f,
                 indent=2,
             )
@@ -210,6 +178,16 @@ def reset_active_template():
                 os.remove(TEMPLATE_FILE)
             except Exception:
                 pass
+
+
+def build_expanded_message(single_line_template: str, target_name: str) -> str:
+    line_content = single_line_template.replace("{TARGET}", target_name)
+    parts = []
+    for idx, newlines_after in enumerate(LINE_GAPS_AFTER):
+        parts.append(line_content)
+        if idx < len(LINE_GAPS_AFTER) - 1:
+            parts.append("\n" * newlines_after)
+    return "".join(parts)
 
 
 # ======================== IG HELPERS ========================
@@ -259,19 +237,36 @@ def get_or_resume_client(username: str) -> Client:
 
 
 def list_threads(client: Client):
-    threads = client.direct_threads(amount=20)
+    threads = client.direct_threads(amount=25)
     out = []
     for t in threads:
+        tid_str = str(t.id).strip()
         if getattr(t, "thread_title", None):
-            title = t.thread_title
+            title = str(t.thread_title)
         elif getattr(t, "users", None):
             names = [u.username for u in t.users if getattr(u, "username", None)]
             title = ", ".join(names) if names else "Direct Chat"
         else:
             title = "Thread"
-        tag = "GC" if getattr(t, "is_group", False) else "DM"
-        out.append({"id": str(t.id), "label": f"[{tag}] {title[:36]}"})
+        is_group = bool(getattr(t, "is_group", False))
+        tag = "GC" if is_group else "DM"
+        out.append({
+            "id": tid_str,
+            "is_group": is_group,
+            "label": f"[{tag}] {title[:32]}",
+        })
     return out
+
+
+def parse_thread_ids(raw_ids) -> list[str]:
+    if not raw_ids:
+        return []
+    result = []
+    for item in raw_ids:
+        s = str(item).strip()
+        if s.isdigit() and s not in result:
+            result.append(s)
+    return result
 
 
 # ======================== WORKER LOOP ========================
@@ -297,10 +292,44 @@ def log_task(task_id: str, msg: str):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {task_id}: {msg}", flush=True)
 
 
-def generate_random_band():
+def generate_slow_band():
     low = random.uniform(25, 45)
     spread = random.uniform(5, 15)
     return (low, min(low + spread, 60))
+
+
+def next_delay(speed_mode: str, slow_band: tuple[float, float]) -> float:
+    if speed_mode == "fast":
+        return random.uniform(10, 20)
+    return random.uniform(slow_band[0], slow_band[1])
+
+
+def group_rename_loop(task_id: str, cl: Client, thread_ids: list[str], target_name: str):
+    """Renames group threads every 10-20 minutes (600-1200s)."""
+    while is_task_running(task_id):
+        interval = random.uniform(600, 1200)
+        slept = 0.0
+        while slept < interval and is_task_running(task_id):
+            step = min(1.0, interval - slept)
+            time.sleep(step)
+            slept += step
+
+        if not is_task_running(task_id):
+            break
+
+        title_tpl = get_active_group_title_template()
+        new_title = title_tpl.replace("{TARGET}", target_name).strip()[:75]
+        if not new_title:
+            continue
+
+        for tid_str in thread_ids:
+            if not is_task_running(task_id):
+                break
+            try:
+                cl.direct_thread_update_title(int(tid_str), new_title)
+                log_task(task_id, f"Renamed group {tid_str} -> {new_title[:28]}")
+            except Exception as exc:
+                log_task(task_id, f"Rename skip/err {tid_str}: {str(exc)[:35]}")
 
 
 def worker_loop(task_id: str):
@@ -312,9 +341,19 @@ def worker_loop(task_id: str):
         cl: Client = task["client"]
         thread_ids = list(task["thread_ids"])
         target_name = task["target_name"]
+        speed_mode = task.get("speed_mode", "slow")
 
-    msg_template = get_active_template().replace("{TARGET}", target_name)
-    band = generate_random_band()
+    renamer = threading.Thread(
+        target=group_rename_loop,
+        args=(task_id, cl, thread_ids, target_name),
+        daemon=True,
+    )
+    renamer.start()
+
+    single_line_tpl = get_active_single_line_template()
+    expanded_msg = build_expanded_message(single_line_tpl, target_name)
+
+    slow_band = generate_slow_band()
     last_band_change = time.time()
     band_interval = random.uniform(3600, 7200)
     round_num = 0
@@ -322,16 +361,16 @@ def worker_loop(task_id: str):
     while is_task_running(task_id):
         try:
             round_num += 1
-            log_task(task_id, f"Round {round_num} started")
-            for tid in thread_ids:
+            log_task(task_id, f"Round {round_num} started ({speed_mode})")
+            for tid_str in thread_ids:
                 if not is_task_running(task_id):
                     break
 
                 num = random.randint(1, 10**10)
                 payload = (
-                    f"{num}\n\n{msg_template}"
+                    f"{num}\n\n{expanded_msg}"
                     if random.choice([True, False])
-                    else f"{msg_template}\n\n{num}"
+                    else f"{expanded_msg}\n\n{num}"
                 )
 
                 sent = False
@@ -339,12 +378,12 @@ def worker_loop(task_id: str):
                     if not is_task_running(task_id):
                         break
                     try:
-                        cl.direct_send(payload, thread_ids=[int(tid)])
+                        cl.direct_send(payload, thread_ids=[int(tid_str)])
                         with tasks_lock:
                             GLOBAL_MESSAGES_SENT += 1
                             if task_id in active_tasks:
                                 active_tasks[task_id]["msg_count"] += 1
-                        log_task(task_id, f"Sent to {tid}")
+                        log_task(task_id, f"Sent to {tid_str}")
                         sent = True
                         break
                     except Exception as exc:
@@ -353,18 +392,18 @@ def worker_loop(task_id: str):
                         time.sleep(wait)
 
                 if not sent and is_task_running(task_id):
-                    log_task(task_id, f"Skipped thread {tid} after retries")
+                    log_task(task_id, f"Skipped thread {tid_str} after retries")
 
-                delay = random.uniform(band[0], band[1])
-                log_task(task_id, f"Cooldown {delay:.1f}s")
+                delay = next_delay(speed_mode, slow_band)
+                log_task(task_id, f"Cooldown {delay:.1f}s ({speed_mode})")
                 slept = 0.0
                 while slept < delay and is_task_running(task_id):
                     step = min(1.0, delay - slept)
                     time.sleep(step)
                     slept += step
 
-                if time.time() - last_band_change >= band_interval:
-                    band = generate_random_band()
+                if speed_mode == "slow" and (time.time() - last_band_change >= band_interval):
+                    slow_band = generate_slow_band()
                     last_band_change = time.time()
                     band_interval = random.uniform(3600, 7200)
         except Exception as exc:
@@ -388,12 +427,14 @@ class PasswordLoginReq(BaseModel):
 
 class StartTaskReq(BaseModel):
     username: str
-    thread_ids: list[int]
+    thread_ids: list[str]
     target_name: str
+    speed_mode: Optional[str] = "slow"
 
 
 class TemplateReq(BaseModel):
     template: str
+    group_title_template: Optional[str] = None
 
 
 # ======================== API ROUTES ========================
@@ -411,7 +452,8 @@ def api_state(x_panel_token: Optional[str] = Header(default=None), token: Option
                 "task_id": tid,
                 "username": info.get("username"),
                 "target_name": info.get("target_name"),
-                "thread_ids": info.get("thread_ids"),
+                "thread_ids": [str(x) for x in info.get("thread_ids", [])],
+                "speed_mode": info.get("speed_mode", "slow"),
                 "running": info.get("running"),
                 "msg_count": info.get("msg_count", 0),
                 "last_event": info.get("last_event", ""),
@@ -423,7 +465,8 @@ def api_state(x_panel_token: Optional[str] = Header(default=None), token: Option
 
     return {
         "accounts": load_saved_accounts(),
-        "template": get_active_template(),
+        "template": get_active_single_line_template(),
+        "group_title_template": get_active_group_title_template(),
         "is_custom_template": os.path.exists(TEMPLATE_FILE),
         "tasks": tasks_view,
         "global_messages_sent": GLOBAL_MESSAGES_SENT,
@@ -461,7 +504,7 @@ def api_login_session(
             raise RuntimeError("Could not verify Instagram user ID.")
         uname = resolve_username(cl)
         save_session(cl, uname, "sessionid")
-        return {"ok": True, "username": uname, "user_id": cl.user_id}
+        return {"ok": True, "username": uname, "user_id": str(cl.user_id)}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {str(exc)[:180]}")
 
@@ -483,13 +526,13 @@ def api_login_password(
             cl.login(uname, body.password, verification_code=body.two_factor_code.strip())
             pending_2fa.pop(uname, None)
             save_session(cl, uname, "password+2fa")
-            return {"ok": True, "username": uname, "user_id": cl.user_id}
+            return {"ok": True, "username": uname, "user_id": str(cl.user_id)}
 
         cl = Client()
         cl.delay_range = [0, 0]
         cl.login(uname, body.password)
         save_session(cl, uname, "password")
-        return {"ok": True, "username": uname, "user_id": cl.user_id}
+        return {"ok": True, "username": uname, "user_id": str(cl.user_id)}
     except TwoFactorRequired:
         pending_2fa[uname] = {"client": cl, "password": body.password}
         return JSONResponse(
@@ -536,10 +579,13 @@ def api_start_task(
     verify_auth(x_panel_token, token)
     uname = body.username.strip().lstrip("@")
     target = body.target_name.strip()
-    tids = [int(x) for x in body.thread_ids if int(x) > 0]
+    tids = parse_thread_ids(body.thread_ids)
+    speed = (body.speed_mode or "slow").strip().lower()
+    if speed not in ("slow", "fast"):
+        raise HTTPException(status_code=400, detail="speed_mode must be 'slow' or 'fast'.")
 
     if not uname or not target or not tids:
-        raise HTTPException(status_code=400, detail="Username, target name, and at least 1 thread ID required.")
+        raise HTTPException(status_code=400, detail="Username, target name, and at least 1 valid numeric thread ID required.")
 
     try:
         cl = get_or_resume_client(uname)
@@ -553,14 +599,15 @@ def api_start_task(
             "username": uname,
             "thread_ids": tids,
             "target_name": target,
+            "speed_mode": speed,
             "running": True,
             "msg_count": 0,
-            "last_event": "Queued",
+            "last_event": "Queued (group rename every 10-20m)",
             "last_update": datetime.now().strftime("%H:%M:%S"),
         }
 
     threading.Thread(target=worker_loop, args=(task_id,), daemon=True).start()
-    return {"ok": True, "task_id": task_id}
+    return {"ok": True, "task_id": task_id, "speed_mode": speed, "thread_ids": tids}
 
 
 @app.post("/api/tasks/{task_id}/stop")
@@ -590,17 +637,26 @@ def api_set_template(
     token: Optional[str] = None,
 ):
     verify_auth(x_panel_token, token)
-    if not body.template.strip():
-        raise HTTPException(status_code=400, detail="Template cannot be empty.")
-    set_active_template(body.template)
-    return {"ok": True}
+    try:
+        set_active_template(body.template, body.group_title_template)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "ok": True,
+        "template": get_active_single_line_template(),
+        "group_title_template": get_active_group_title_template(),
+    }
 
 
 @app.post("/api/template/reset")
 def api_reset_template(x_panel_token: Optional[str] = Header(default=None), token: Optional[str] = None):
     verify_auth(x_panel_token, token)
     reset_active_template()
-    return {"ok": True, "template": get_active_template()}
+    return {
+        "ok": True,
+        "template": get_active_single_line_template(),
+        "group_title_template": get_active_group_title_template(),
+    }
 
 
 # ======================== WEB UI ========================
@@ -625,31 +681,35 @@ HTML_PAGE = """<!DOCTYPE html>
     }
     * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
     body { margin: 0; background: var(--bg); color: var(--text); padding: 20px; }
-    .wrap { max-width: 1050px; margin: 0 auto; display: grid; gap: 16px; }
+    .wrap { max-width: 1080px; margin: 0 auto; display: grid; gap: 16px; }
     .top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; }
-    .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+    .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 16px; }
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
     h1, h2, h3 { margin: 0 0 10px; }
     h1 { font-size: 1.35rem; }
     h2 { font-size: 1.05rem; }
     label { display: block; font-size: 0.85rem; color: var(--muted); margin: 10px 0 4px; }
-    input, textarea, select {
+    input, select {
       width: 100%; background: #0d1017; color: var(--text); border: 1px solid var(--border);
       border-radius: 8px; padding: 9px 11px; font-size: 0.92rem;
     }
-    textarea { min-height: 110px; font-family: monospace; }
     button {
       background: var(--accent); color: #fff; border: 0; border-radius: 8px;
-      padding: 9px 14px; font-weight: 600; cursor: pointer; font-size: 0.88rem;
+      padding: 8px 12px; font-weight: 600; cursor: pointer; font-size: 0.85rem;
     }
     button:hover { opacity: 0.92; }
     button.secondary { background: #262c3a; color: var(--text); }
+    button.picked { background: #1d4ed8; border: 1px solid #60a5fa; color: #fff; }
     button.danger { background: var(--red); }
     button.warn { background: var(--amber); color: #111; }
     .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; align-items: center; }
+    .picker-box { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; margin-top: 8px; }
+    .pick-btn { width: 100%; text-align: left; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .tid-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.76rem; opacity: 0.85; word-break: break-all; }
     .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.78rem; font-weight: 600; }
     .on { background: rgba(34,197,94,0.16); color: var(--green); }
     .off { background: rgba(239,68,68,0.16); color: var(--red); }
+    .speed-badge { background: rgba(59,130,246,0.16); color: #93c5fd; }
     .muted { color: var(--muted); font-size: 0.85rem; }
     .list-item { border-top: 1px solid var(--border); padding: 10px 0; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
     .list-item:first-child { border-top: 0; }
@@ -690,22 +750,32 @@ HTML_PAGE = """<!DOCTYPE html>
       </div>
 
       <div class="card">
-        <h2>2. Start Task</h2>
+        <h2>2. Start Task & Group Selector</h2>
         <label>Account</label>
         <select id="taskAccount"></select>
 
         <div class="row">
-          <button class="secondary" onclick="fetchThreads()">Load Recent Chats</button>
+          <button class="secondary" onclick="fetchThreads()">Load Chats / Groups</button>
+          <button class="secondary" onclick="selectAllLoaded(true)">Select All</button>
+          <button class="secondary" onclick="selectAllLoaded(false)">Clear</button>
           <span class="muted" id="threadStatus"></span>
         </div>
 
-        <label>Thread IDs (comma-separated or pick below)</label>
-        <input id="threadIdsInput" placeholder="e.g. 178412345, 178998877" />
-        <div id="threadPicker" class="row"></div>
+        <div id="threadPicker" class="picker-box"></div>
+
+        <label>Selected Thread IDs (auto-filled or paste comma-separated IDs)</label>
+        <input id="threadIdsInput" type="text" placeholder="Tap chats above or paste full numeric IDs" />
 
         <label>Target Name ({TARGET})</label>
         <input id="targetInput" placeholder="Enter target name" />
 
+        <label>Message Speed</label>
+        <select id="speedMode">
+          <option value="slow" selected>Slow (25–45s + spread, current default)</option>
+          <option value="fast">Fast (10–20s delay)</option>
+        </select>
+
+        <div class="muted" style="margin-top:8px;">Group title automatically updates every 10–20 minutes using the Group Title template.</div>
         <div class="row"><button onclick="startTask()">Start Task</button></div>
       </div>
     </div>
@@ -717,12 +787,17 @@ HTML_PAGE = """<!DOCTYPE html>
       </div>
 
       <div class="card">
-        <h2>4. Message Template</h2>
-        <div class="muted">Use <code>{TARGET}</code> where target name should be inserted.</div>
-        <textarea id="templateArea"></textarea>
+        <h2>4. Message & Group Rename Templates</h2>
+        <div class="muted">Enter <strong>one line</strong> using <code>{TARGET}</code>. Expands into 11 lines with original gaps.</div>
+        <label>Single Line Message Template</label>
+        <input id="templateLineInput" type="text" placeholder="<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> -🌒-" />
+
+        <label>Group Name Template (every 10–20 mins, uses <code>{TARGET}</code>)</label>
+        <input id="groupTitleInput" type="text" placeholder="{TARGET}" />
+
         <div class="row">
-          <button onclick="saveTemplate()">Save Template</button>
-          <button class="warn" onclick="resetTemplate()">Reset Default</button>
+          <button onclick="saveTemplate()">Save Templates</button>
+          <button class="warn" onclick="resetTemplate()">Reset Defaults</button>
         </div>
       </div>
     </div>
@@ -733,6 +808,7 @@ HTML_PAGE = """<!DOCTYPE html>
   <script>
     const TOKEN_KEY = "ig_panel_token";
     document.getElementById("tokenInput").value = localStorage.getItem(TOKEN_KEY) || "";
+    let loadedThreads = [];
 
     function showToast(msg, err = false) {
       const el = document.getElementById("toast");
@@ -765,6 +841,58 @@ HTML_PAGE = """<!DOCTYPE html>
       return { status: res.status, data };
     }
 
+    function getSelectedThreadStrings() {
+      return document.getElementById("threadIdsInput").value
+        .split(",")
+        .map(s => s.trim())
+        .filter(s => /^\d+$/.test(s));
+    }
+
+    function renderThreadPicker() {
+      const selected = new Set(getSelectedThreadStrings());
+      const picker = document.getElementById("threadPicker");
+      if (!loadedThreads.length) {
+        picker.innerHTML = "";
+        return;
+      }
+      picker.innerHTML = loadedThreads.map(t => {
+        const idStr = String(t.id);
+        const isPicked = selected.has(idStr);
+        return `<button type="button" class="pick-btn ${isPicked ? "picked" : "secondary"}" onclick="toggleThreadId('${idStr}')">
+          <span>${isPicked ? "✅" : "⬜"} ${escapeHtml(t.label)}</span>
+          <span class="tid-mono">${escapeHtml(idStr)}</span>
+        </button>`;
+      }).join("");
+    }
+
+    function escapeHtml(s) {
+      return String(s || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function toggleThreadId(idStr) {
+      const cleanId = String(idStr).trim();
+      const input = document.getElementById("threadIdsInput");
+      const list = getSelectedThreadStrings();
+      const idx = list.indexOf(cleanId);
+      if (idx >= 0) list.splice(idx, 1);
+      else list.push(cleanId);
+      input.value = list.join(", ");
+      renderThreadPicker();
+    }
+
+    function selectAllLoaded(selectAll) {
+      if (!loadedThreads.length) return showToast("Load chats/groups first", true);
+      document.getElementById("threadIdsInput").value = selectAll
+        ? loadedThreads.map(t => String(t.id).trim()).filter(s => /^\d+$/.test(s)).join(", ")
+        : "";
+      renderThreadPicker();
+    }
+
     async function refreshState() {
       try {
         const { data } = await api("/api/state");
@@ -775,7 +903,7 @@ HTML_PAGE = """<!DOCTYPE html>
         const accs = Object.keys(data.accounts || {});
         const sel = document.getElementById("taskAccount");
         const prev = sel.value;
-        sel.innerHTML = accs.map(u => `<option value="${u}">@${u}</option>`).join("");
+        sel.innerHTML = accs.map(u => `<option value="${escapeHtml(u)}">@${escapeHtml(u)}</option>`).join("");
         if (accs.includes(prev)) sel.value = prev;
 
         const accBox = document.getElementById("accountsList");
@@ -785,8 +913,8 @@ HTML_PAGE = """<!DOCTYPE html>
           accBox.innerHTML = accs.map(u => {
             const m = data.accounts[u];
             return `<div class="list-item">
-              <div><strong>@${u}</strong> <span class="muted">(${m.auth_method || "saved"})</span></div>
-              <button class="secondary" onclick="deleteAccount('${u}')">Remove</button>
+              <div><strong>@${escapeHtml(u)}</strong> <span class="muted">(${escapeHtml(m.auth_method || "saved")})</span></div>
+              <button class="secondary" onclick="deleteAccount('${escapeHtml(u)}')">Remove</button>
             </div>`;
           }).join("");
         }
@@ -798,19 +926,24 @@ HTML_PAGE = """<!DOCTYPE html>
           tBox.innerHTML = data.tasks.map(t => `
             <div class="list-item">
               <div>
-                <div><strong>${t.task_id}</strong> · @${t.username} → <strong>${t.target_name}</strong>
+                <div><strong>${escapeHtml(t.task_id)}</strong> · @${escapeHtml(t.username)} → <strong>${escapeHtml(t.target_name)}</strong>
                   <span class="badge ${t.running ? "on" : "off"}">${t.running ? "RUNNING" : "STOPPED"}</span>
+                  <span class="badge speed-badge">${escapeHtml((t.speed_mode || "slow").toUpperCase())}</span>
                 </div>
-                <div class="muted">Sent: ${t.msg_count} · ${t.last_event || "Idle"} (${t.last_update || ""})</div>
+                <div class="muted">Sent: ${t.msg_count} · ${escapeHtml(t.last_event || "Idle")} (${escapeHtml(t.last_update || "")})</div>
               </div>
-              ${t.running ? `<button class="danger" onclick="stopTask('${t.task_id}')">Stop</button>` : ""}
+              ${t.running ? `<button class="danger" onclick="stopTask('${escapeHtml(t.task_id)}')">Stop</button>` : ""}
             </div>
           `).join("");
         }
 
-        const tplEl = document.getElementById("templateArea");
+        const tplEl = document.getElementById("templateLineInput");
         if (document.activeElement !== tplEl) {
           tplEl.value = data.template || "";
+        }
+        const gtEl = document.getElementById("groupTitleInput");
+        if (document.activeElement !== gtEl) {
+          gtEl.value = data.group_title_template || "{TARGET}";
         }
       } catch (e) {
         document.getElementById("statsBar").textContent = e.message;
@@ -854,25 +987,15 @@ HTML_PAGE = """<!DOCTYPE html>
       } catch (e) { showToast(e.message, true); }
     }
 
-    function toggleThreadId(id) {
-      const input = document.getElementById("threadIdsInput");
-      const list = input.value.split(",").map(s => s.trim()).filter(Boolean);
-      const idx = list.indexOf(String(id));
-      if (idx >= 0) list.splice(idx, 1); else list.push(String(id));
-      input.value = list.join(", ");
-    }
-
     async function fetchThreads() {
       const u = document.getElementById("taskAccount").value;
       if (!u) return showToast("Select an account first", true);
       document.getElementById("threadStatus").textContent = "Loading...";
       try {
         const { data } = await api(`/api/threads/${encodeURIComponent(u)}`);
-        const picker = document.getElementById("threadPicker");
-        picker.innerHTML = (data.threads || []).map(t =>
-          `<button class="secondary" onclick="toggleThreadId('${t.id}')">${t.label} (${t.id})</button>`
-        ).join("");
-        document.getElementById("threadStatus").textContent = `${(data.threads || []).length} loaded`;
+        loadedThreads = Array.isArray(data.threads) ? data.threads : [];
+        renderThreadPicker();
+        document.getElementById("threadStatus").textContent = `${loadedThreads.length} loaded`;
       } catch (e) {
         document.getElementById("threadStatus").textContent = "";
         showToast(e.message, true);
@@ -883,10 +1006,10 @@ HTML_PAGE = """<!DOCTYPE html>
       try {
         const username = document.getElementById("taskAccount").value;
         const target_name = document.getElementById("targetInput").value.trim();
-        const thread_ids = document.getElementById("threadIdsInput").value
-          .split(",").map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n) && n > 0);
-        const { data } = await api("/api/tasks/start", "POST", { username, thread_ids, target_name });
-        showToast(`Started task ${data.task_id}`);
+        const speed_mode = document.getElementById("speedMode").value;
+        const thread_ids = getSelectedThreadStrings();
+        const { data } = await api("/api/tasks/start", "POST", { username, thread_ids, target_name, speed_mode });
+        showToast(`Started task ${data.task_id} (${data.speed_mode})`);
         refreshState();
       } catch (e) { showToast(e.message, true); }
     }
@@ -909,20 +1032,25 @@ HTML_PAGE = """<!DOCTYPE html>
 
     async function saveTemplate() {
       try {
-        const template = document.getElementById("templateArea").value;
-        await api("/api/template", "POST", { template });
-        showToast("Template saved");
+        const template = document.getElementById("templateLineInput").value;
+        const group_title_template = document.getElementById("groupTitleInput").value;
+        const { data } = await api("/api/template", "POST", { template, group_title_template });
+        document.getElementById("templateLineInput").value = data.template || template;
+        document.getElementById("groupTitleInput").value = data.group_title_template || "{TARGET}";
+        showToast("Templates saved");
       } catch (e) { showToast(e.message, true); }
     }
 
     async function resetTemplate() {
       try {
-        await api("/api/template/reset", "POST");
-        showToast("Template reset to default");
-        refreshState();
+        const { data } = await api("/api/template/reset", "POST");
+        document.getElementById("templateLineInput").value = data.template || "";
+        document.getElementById("groupTitleInput").value = data.group_title_template || "{TARGET}";
+        showToast("Templates reset to defaults");
       } catch (e) { showToast(e.message, true); }
     }
 
+    document.getElementById("threadIdsInput").addEventListener("input", renderThreadPicker);
     refreshState();
     setInterval(refreshState, 4000);
   </script>
