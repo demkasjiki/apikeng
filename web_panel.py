@@ -24,6 +24,13 @@ from pydantic import BaseModel
 PORT = int(os.environ.get("PORT", "8000"))
 PANEL_TOKEN = os.environ.get("PANEL_TOKEN", "").strip()
 
+IG_APP_VERSION = os.environ.get("IG_APP_VERSION", "345.0.0.25.107").strip()
+IG_VERSION_CODE = os.environ.get("IG_VERSION_CODE", "636942882").strip()
+IG_USER_AGENT = os.environ.get(
+    "IG_USER_AGENT",
+    f"Instagram {IG_APP_VERSION} Android (33/13; 420dpi; 1080x2400; samsung; SM-G991B; o1s; exynos2100; en_US; {IG_VERSION_CODE})",
+).strip()
+
 DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else "./data")
 os.makedirs(DATA_DIR, exist_ok=True)
 ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
@@ -77,7 +84,7 @@ def load_saved_accounts() -> dict:
             return {}
 
 
-def register_saved_account(username: str, ig_user_id=None, auth_method: str = "sessionid"):
+def register_saved_account(username: str, ig_user_id=None, auth_method: str = "password"):
     with store_lock:
         accounts = {}
         if os.path.exists(ACCOUNTS_FILE):
@@ -191,7 +198,6 @@ def render_single_line_with_random_emoji(base_line: str, target_name: str) -> st
     rendered = base_line.replace("{TARGET}", target_name).replace("{EMOJI}", chosen_emoji)
     if "-🌒-" in rendered:
         return rendered.replace("-🌒-", f"-{chosen_emoji}-")
-    # If user customized the single line and kept a trailing `-<token>-` marker, swap its inner token per line
     if re.search(r"-[^\s-]+-\s*$", rendered):
         return re.sub(r"-[^\s-]+-(\s*)$", f"-{chosen_emoji}-\\1", rendered)
     return f"{rendered} -{chosen_emoji}-"
@@ -207,6 +213,27 @@ def build_expanded_message(single_line_template: str, target_name: str) -> str:
 
 
 # ======================== IG HELPERS ========================
+
+def make_ig_client() -> Client:
+    cl = Client()
+    cl.delay_range = [0, 0]
+    try:
+        if IG_APP_VERSION:
+            cl.set_app_version(IG_APP_VERSION)
+    except Exception:
+        pass
+    try:
+        if IG_USER_AGENT:
+            cl.set_user_agent(IG_USER_AGENT)
+    except Exception:
+        pass
+    if IG_VERSION_CODE:
+        try:
+            cl.version_code = IG_VERSION_CODE
+        except Exception:
+            pass
+    return cl
+
 
 def clean_session_id(raw: str) -> str:
     val = raw.strip().strip('"').strip("'")
@@ -243,8 +270,7 @@ def get_or_resume_client(username: str) -> Client:
     session_path = os.path.join(DATA_DIR, f"ig_{username}.json")
     if not os.path.exists(session_path):
         raise RuntimeError(f"Saved session for @{username} not found.")
-    cl = Client()
-    cl.delay_range = [0, 0]
+    cl = make_ig_client()
     cl.load_settings(session_path)
     cl.account_info()
     cl.dump_settings(session_path)
@@ -519,8 +545,7 @@ def api_login_session(
     if not cleaned:
         raise HTTPException(status_code=400, detail="Session ID is empty.")
     try:
-        cl = Client()
-        cl.delay_range = [0, 0]
+        cl = make_ig_client()
         cl.login_by_sessionid(cleaned)
         if not getattr(cl, "user_id", None):
             info = cl.account_info()
@@ -546,6 +571,7 @@ def api_login_password(
     if not uname or not body.password:
         raise HTTPException(status_code=400, detail="Username and password are required.")
 
+    cl = None
     try:
         if body.two_factor_code and uname in pending_2fa:
             cl = pending_2fa[uname]["client"]
@@ -554,13 +580,13 @@ def api_login_password(
             save_session(cl, uname, "password+2fa")
             return {"ok": True, "username": uname, "user_id": str(cl.user_id)}
 
-        cl = Client()
-        cl.delay_range = [0, 0]
+        cl = make_ig_client()
         cl.login(uname, body.password)
         save_session(cl, uname, "password")
         return {"ok": True, "username": uname, "user_id": str(cl.user_id)}
     except TwoFactorRequired:
-        pending_2fa[uname] = {"client": cl, "password": body.password}
+        if cl is not None:
+            pending_2fa[uname] = {"client": cl, "password": body.password}
         return JSONResponse(
             status_code=202,
             content={"two_factor_required": True, "username": uname, "detail": "Enter 6-digit 2FA code."},
@@ -694,7 +720,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>IG Web Controller</title>
+  <title>ρ 𝕣 ꪜ 𝕣 अब्बू ☽ · IG Web Controller</title>
   <style>
     :root {
       --bg: #0f1117;
@@ -710,6 +736,23 @@ HTML_PAGE = """<!DOCTYPE html>
     * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
     body { margin: 0; background: var(--bg); color: var(--text); padding: 20px; }
     .wrap { max-width: 1080px; margin: 0 auto; display: grid; gap: 16px; }
+    .hero-banner {
+      background: linear-gradient(135deg, #1b2234 0%, #151923 55%, #1f1b2e 100%);
+      border: 1px solid #334155;
+      border-radius: 14px;
+      padding: 22px 20px;
+      text-align: center;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+    }
+    .hero-banner-text {
+      font-size: clamp(1.8rem, 4.5vw, 3rem);
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      line-height: 1.2;
+      color: #f8fafc;
+      text-shadow: 0 2px 18px rgba(59, 130, 246, 0.35);
+      word-break: break-word;
+    }
     .top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; }
     .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 16px; }
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
@@ -742,11 +785,17 @@ HTML_PAGE = """<!DOCTYPE html>
     .muted { color: var(--muted); font-size: 0.85rem; }
     .list-item { border-top: 1px solid var(--border); padding: 10px 0; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
     .list-item:first-child { border-top: 0; }
+    details { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 10px; }
+    summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; }
     .toast { position: fixed; bottom: 18px; right: 18px; background: #1f2937; border: 1px solid var(--border); padding: 10px 14px; border-radius: 8px; display: none; z-index: 50; }
   </style>
 </head>
 <body>
   <div class="wrap">
+    <div class="hero-banner">
+      <div class="hero-banner-text">ρ 𝕣 ꪜ 𝕣 अब्बू ☽</div>
+    </div>
+
     <div class="top">
       <div>
         <h1>Instagram Automation Web Panel</h1>
@@ -761,18 +810,23 @@ HTML_PAGE = """<!DOCTYPE html>
 
     <div class="grid-2">
       <div class="card">
-        <h2>1. Login & Saved Accounts</h2>
-        <label>Login via Session ID</label>
-        <input id="sidInput" type="password" placeholder="Paste sessionid cookie value" />
-        <div class="row"><button onclick="loginSession()">Login with Session ID</button></div>
-
-        <label style="margin-top:16px;">Or Login with Username & Password</label>
+        <h2>1. Login (Username & Password)</h2>
+        <label>Instagram Username</label>
         <input id="igUser" placeholder="Instagram username" />
-        <input id="igPass" type="password" placeholder="Instagram password" style="margin-top:6px;" />
+        <label>Instagram Password</label>
+        <input id="igPass" type="password" placeholder="Instagram password" />
         <div id="tfaBox" style="display:none;">
-          <input id="ig2fa" placeholder="6-digit 2FA code" style="margin-top:6px;" />
+          <label>6-Digit 2FA Code</label>
+          <input id="ig2fa" placeholder="6-digit 2FA code" />
         </div>
-        <div class="row"><button class="secondary" onclick="loginPassword()">Login with Password</button></div>
+        <div class="row"><button onclick="loginPassword()">Login with Password</button></div>
+
+        <details>
+          <summary>Fallback: Login via Session ID</summary>
+          <label>Session ID Cookie</label>
+          <input id="sidInput" type="password" placeholder="Paste sessionid cookie value" />
+          <div class="row"><button class="secondary" onclick="loginSession()">Login with Session ID</button></div>
+        </details>
 
         <h3 style="margin-top:16px; font-size:0.95rem;">Saved Accounts</h3>
         <div id="accountsList" class="muted">None yet.</div>
@@ -810,6 +864,7 @@ HTML_PAGE = """<!DOCTYPE html>
           <option value="false">Run without NC</option>
         </select>
 
+        <div class="muted" style="margin-top:8px;">Group title automatically updates every 10–20 minutes using the Group Title template.</div>
         <div class="row"><button onclick="startTask()">Start Task</button></div>
       </div>
     </div>
