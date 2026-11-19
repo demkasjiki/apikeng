@@ -312,17 +312,34 @@ def parse_thread_ids(raw_ids) -> list[str]:
     return result
 
 
-def parse_user_ids(raw_users: Optional[list]) -> list[int]:
-    if not raw_users:
+def parse_usernames(raw_usernames: Optional[list]) -> list[str]:
+    if not raw_usernames:
         return []
     out = []
-    for u in raw_users:
-        s = str(u).strip()
-        if s.isdigit():
-            val = int(s)
-            if val > 0 and val not in out:
-                out.append(val)
+    for item in raw_usernames:
+        clean = str(item).strip().lstrip("@").lower()
+        if clean and clean not in out:
+            out.append(clean)
     return out
+
+
+def resolve_usernames_to_ids(cl: Client, usernames: list[str]) -> tuple[list[int], list[str]]:
+    resolved_ids: list[int] = []
+    failed: list[str] = []
+    my_uid = int(getattr(cl, "user_id", 0) or 0)
+
+    for idx, uname in enumerate(usernames):
+        try:
+            uid_str = cl.user_id_from_username(uname)
+            uid_int = int(str(uid_str).strip())
+            if uid_int > 0 and uid_int != my_uid and uid_int not in resolved_ids:
+                resolved_ids.append(uid_int)
+        except Exception as exc:
+            failed.append(f"@{uname} ({str(exc)[:30]})")
+        if idx < len(usernames) - 1:
+            time.sleep(random.uniform(1.2, 2.5))
+
+    return resolved_ids, failed
 
 
 def _find_invite_url_in_obj(obj) -> Optional[str]:
@@ -374,7 +391,6 @@ def extract_group_invite_link(cl: Client, tid_str: str) -> dict:
     except Exception:
         pass
 
-    # Fallback: check private Direct invite endpoints if available on client
     for endpoint, method in [
         (f"direct_v2/threads/{tid_int}/get_invite_link/", "GET"),
         (f"direct_v2/threads/{tid_int}/create_invite_link/", "POST"),
@@ -408,13 +424,13 @@ def extract_group_invite_link(cl: Client, tid_str: str) -> dict:
     }
 
 
-def _create_single_group(cl: Client, title: str, extra_user_ids: list[int], send_ping: bool) -> str:
+def _create_single_group(cl: Client, title: str, member_user_ids: list[int], send_ping: bool) -> str:
     my_uid = int(getattr(cl, "user_id", 0) or 0)
-    participants = [uid for uid in extra_user_ids if uid and uid != my_uid]
+    participants = [uid for uid in member_user_ids if uid and uid != my_uid]
+    if len(participants) < 2:
+        raise RuntimeError("Instagram requires at least 2 valid other usernames to create a group thread.")
     if my_uid and my_uid not in participants:
         participants.insert(0, my_uid)
-    if not participants:
-        raise RuntimeError("No valid user IDs available to create group thread.")
 
     created = cl.direct_thread_create(participants, title=title[:75])
     if hasattr(created, "id"):
@@ -469,10 +485,26 @@ def group_creator_loop(job_id: str):
         count = int(job["count"])
         title_tpl = str(job["title_template"])
         target_name = str(job["target_name"])
-        user_ids = list(job["user_ids"])
+        usernames = list(job["usernames"])
         send_ping = bool(job["send_ping"])
         min_cd = float(job["min_cooldown"])
         max_cd = float(job["max_cooldown"])
+
+    log_creator(job_id, f"Resolving {len(usernames)} username(s)...")
+    resolved_ids, failed_users = resolve_usernames_to_ids(cl, usernames)
+    if failed_users:
+        log_creator(job_id, f"Unresolved: {', '.join(failed_users)}", err="; ".join(failed_users))
+
+    if len(resolved_ids) < 2:
+        set_creator_running(job_id, False)
+        log_creator(
+            job_id,
+            f"Need >=2 valid usernames (resolved {len(resolved_ids)})",
+            err=f"Only resolved {len(resolved_ids)} user IDs from {usernames}",
+        )
+        return
+
+    log_creator(job_id, f"Resolved {len(resolved_ids)} users; creating {count} group(s)")
 
     for idx in range(1, count + 1):
         if not is_creator_running(job_id):
@@ -488,7 +520,7 @@ def group_creator_loop(job_id: str):
             if not is_creator_running(job_id):
                 return
             try:
-                tid_str = _create_single_group(cl, rendered_title, user_ids, send_ping)
+                tid_str = _create_single_group(cl, rendered_title, resolved_ids, send_ping)
                 log_creator(
                     job_id,
                     f"Created {idx}/{count} -> {tid_str}",
@@ -710,7 +742,7 @@ class CreateGroupsReq(BaseModel):
     count: int = 1
     title_template: Optional[str] = None
     target_name: Optional[str] = ""
-    user_ids: Optional[list[str]] = None
+    usernames: list[str] = []
     send_ping: Optional[bool] = True
     min_cooldown: Optional[float] = 25.0
     max_cooldown: Optional[float] = 45.0
@@ -887,16 +919,18 @@ def api_create_groups(
     verify_auth(x_panel_token, token)
     uname = body.username.strip().lstrip("@")
     count = int(body.count or 1)
+    unames = parse_usernames(body.usernames)
     if not uname:
         raise HTTPException(status_code=400, detail="Account username is required.")
     if count < 1 or count > 50:
         raise HTTPException(status_code=400, detail="Group count must be between 1 and 50.")
+    if len(unames) < 2:
+        raise HTTPException(status_code=400, detail="Enter at least 2 usernames (comma-separated) to create a group.")
 
     min_cd = max(10.0, float(body.min_cooldown if body.min_cooldown is not None else 25.0))
     max_cd = max(min_cd, float(body.max_cooldown if body.max_cooldown is not None else 45.0))
     title_tpl = (body.title_template or "").strip() or get_active_group_title_template()
     target_name = (body.target_name or "").strip()
-    uids = parse_user_ids(body.user_ids)
     send_ping = bool(True if body.send_ping is None else body.send_ping)
 
     try:
@@ -913,7 +947,7 @@ def api_create_groups(
             "count": count,
             "title_template": title_tpl,
             "target_name": target_name,
-            "user_ids": uids,
+            "usernames": unames,
             "send_ping": send_ping,
             "min_cooldown": min_cd,
             "max_cooldown": max_cd,
@@ -921,12 +955,12 @@ def api_create_groups(
             "created_count": 0,
             "created_ids": [],
             "errors": [],
-            "last_event": f"Queued ({count} groups, {min_cd:.0f}-{max_cd:.0f}s cd)",
+            "last_event": f"Queued ({count} groups, {len(unames)} users, {min_cd:.0f}-{max_cd:.0f}s cd)",
             "last_update": datetime.now().strftime("%H:%M:%S"),
         }
 
     threading.Thread(target=group_creator_loop, args=(job_id,), daemon=True).start()
-    return {"ok": True, "job_id": job_id, "count": count}
+    return {"ok": True, "job_id": job_id, "count": count, "usernames": unames}
 
 
 @app.post("/api/groups/create/{job_id}/stop")
@@ -1142,7 +1176,6 @@ HTML_PAGE = """<!DOCTYPE html>
       width: 100%; background: #0d1017; color: var(--text); border: 1px solid var(--border);
       border-radius: 8px; padding: 9px 11px; font-size: 0.92rem;
     }
-    textarea { resize: vertical; min-height: 76px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem; }
     button {
       background: linear-gradient(135deg, #3b82f6, #8b5cf6); color: #fff; border: 0; border-radius: 8px;
       padding: 8px 12px; font-weight: 600; cursor: pointer; font-size: 0.85rem;
@@ -1260,9 +1293,12 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="grid-2">
       <div class="card">
         <h2>3. Group Chat Creator (With Cooldowns)</h2>
-        <div class="muted">Creates groups one by one with cooldowns to avoid API limits. Supports <code>{TARGET}</code> and <code>{N}</code>.</div>
+        <div class="muted">Enter at least <strong>2 usernames</strong>. Resolves usernames to IDs and creates groups with cooldowns.</div>
         <label>Account</label>
         <select id="gcCreatorAccount"></select>
+
+        <label>Usernames to Add (comma-separated, at least 2)</label>
+        <input id="gcCreateUsernames" type="text" placeholder="e.g. @user_one, @user_two, user_three" />
 
         <div class="two-col-inline">
           <div>
@@ -1277,9 +1313,6 @@ HTML_PAGE = """<!DOCTYPE html>
 
         <label>Group Title Template</label>
         <input id="gcCreateTitle" type="text" placeholder="{TARGET} #{N}" />
-
-        <label>Extra User IDs (optional comma-separated numeric IG user IDs)</label>
-        <input id="gcCreateUsers" type="text" placeholder="Leave blank to create with your account" />
 
         <div class="two-col-inline">
           <div>
@@ -1615,14 +1648,14 @@ HTML_PAGE = """<!DOCTYPE html>
         const count = parseInt(document.getElementById("gcCreateCount").value, 10) || 1;
         const target_name = document.getElementById("gcCreateTarget").value.trim() || document.getElementById("targetInput").value.trim();
         const title_template = document.getElementById("gcCreateTitle").value.trim() || null;
-        const user_ids = document.getElementById("gcCreateUsers").value
-          .split(",").map(s => s.trim()).filter(s => /^\d+$/.test(s));
+        const usernames = document.getElementById("gcCreateUsernames").value
+          .split(",").map(s => s.trim().replace(/^@+/, "")).filter(Boolean);
         const min_cooldown = parseFloat(document.getElementById("gcMinCd").value) || 25;
         const max_cooldown = parseFloat(document.getElementById("gcMaxCd").value) || 45;
         const send_ping = document.getElementById("gcSendPing").value === "true";
 
         const { data } = await api("/api/groups/create", "POST", {
-          username, count, title_template, target_name, user_ids, min_cooldown, max_cooldown, send_ping
+          username, count, title_template, target_name, usernames, min_cooldown, max_cooldown, send_ping
         });
         showToast(`Started group creator ${data.job_id} (${data.count} groups)`);
         refreshState();
