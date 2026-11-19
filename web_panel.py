@@ -50,6 +50,7 @@ EMOJI_POOL = [
 MAX_RETRIES = 5
 
 active_tasks: dict = {}
+group_creator_jobs: dict = {}
 client_cache: dict = {}
 pending_2fa: dict = {}
 tasks_lock = threading.Lock()
@@ -311,6 +312,222 @@ def parse_thread_ids(raw_ids) -> list[str]:
     return result
 
 
+def parse_user_ids(raw_users: Optional[list]) -> list[int]:
+    if not raw_users:
+        return []
+    out = []
+    for u in raw_users:
+        s = str(u).strip()
+        if s.isdigit():
+            val = int(s)
+            if val > 0 and val not in out:
+                out.append(val)
+    return out
+
+
+def _find_invite_url_in_obj(obj) -> Optional[str]:
+    if obj is None:
+        return None
+    if isinstance(obj, str):
+        m = re.search(r"https?://(?:www\.)?ig\.me/j/[A-Za-z0-9_-]+/?", obj)
+        if m:
+            return m.group(0)
+        m2 = re.search(r"https?://(?:www\.)?instagram\.com/j/[A-Za-z0-9_-]+/?", obj)
+        if m2:
+            return m2.group(0)
+        return None
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).lower()
+            if ("invite" in kl or "join" in kl or "url" in kl or "link" in kl) and isinstance(v, str):
+                found = _find_invite_url_in_obj(v)
+                if found:
+                    return found
+            found = _find_invite_url_in_obj(v)
+            if found:
+                return found
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            found = _find_invite_url_in_obj(item)
+            if found:
+                return found
+    else:
+        d = getattr(obj, "__dict__", None)
+        if isinstance(d, dict):
+            return _find_invite_url_in_obj(d)
+    return None
+
+
+def extract_group_invite_link(cl: Client, tid_str: str) -> dict:
+    tid_int = int(tid_str)
+    title = f"Thread {tid_str}"
+    is_group = True
+
+    try:
+        th = cl.direct_thread(tid_int, amount=1)
+        if getattr(th, "thread_title", None):
+            title = str(th.thread_title)
+        is_group = bool(getattr(th, "is_group", True))
+        link = _find_invite_url_in_obj(th)
+        if link:
+            return {"thread_id": tid_str, "title": title, "is_group": is_group, "invite_link": link, "status": "ok"}
+    except Exception:
+        pass
+
+    # Fallback: check private Direct invite endpoints if available on client
+    for endpoint, method in [
+        (f"direct_v2/threads/{tid_int}/get_invite_link/", "GET"),
+        (f"direct_v2/threads/{tid_int}/create_invite_link/", "POST"),
+        (f"direct_v2/threads/{tid_int}/invite_link/", "GET"),
+    ]:
+        try:
+            if hasattr(cl, "private_request"):
+                data = (
+                    cl.private_request(endpoint, data={})
+                    if method == "POST"
+                    else cl.private_request(endpoint)
+                )
+                link = _find_invite_url_in_obj(data)
+                if link:
+                    return {
+                        "thread_id": tid_str,
+                        "title": title,
+                        "is_group": is_group,
+                        "invite_link": link,
+                        "status": "ok",
+                    }
+        except Exception:
+            continue
+
+    return {
+        "thread_id": tid_str,
+        "title": title,
+        "is_group": is_group,
+        "invite_link": None,
+        "status": "unavailable (enable invite link on mobile or verify group admin rights)",
+    }
+
+
+def _create_single_group(cl: Client, title: str, extra_user_ids: list[int], send_ping: bool) -> str:
+    my_uid = int(getattr(cl, "user_id", 0) or 0)
+    participants = [uid for uid in extra_user_ids if uid and uid != my_uid]
+    if my_uid and my_uid not in participants:
+        participants.insert(0, my_uid)
+    if not participants:
+        raise RuntimeError("No valid user IDs available to create group thread.")
+
+    created = cl.direct_thread_create(participants, title=title[:75])
+    if hasattr(created, "id"):
+        tid_str = str(created.id).strip()
+    elif isinstance(created, dict) and created.get("thread_id"):
+        tid_str = str(created["thread_id"]).strip()
+    else:
+        tid_str = str(created).strip()
+
+    if send_ping and tid_str.isdigit():
+        try:
+            cl.direct_send(title[:75] or "✨", thread_ids=[int(tid_str)])
+        except Exception:
+            pass
+    return tid_str
+
+
+# ======================== GROUP CREATOR LOOP ========================
+
+def is_creator_running(job_id: str) -> bool:
+    with tasks_lock:
+        return bool(group_creator_jobs.get(job_id, {}).get("running", False))
+
+
+def set_creator_running(job_id: str, running: bool):
+    with tasks_lock:
+        if job_id in group_creator_jobs:
+            group_creator_jobs[job_id]["running"] = running
+
+
+def log_creator(job_id: str, msg: str, created_id: Optional[str] = None, err: Optional[str] = None):
+    with tasks_lock:
+        job = group_creator_jobs.get(job_id)
+        if not job:
+            return
+        job["last_event"] = msg
+        job["last_update"] = datetime.now().strftime("%H:%M:%S")
+        if created_id:
+            job["created_ids"].append(created_id)
+            job["created_count"] = len(job["created_ids"])
+        if err:
+            job["errors"].append(err)
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] GC_JOB {job_id}: {msg}", flush=True)
+
+
+def group_creator_loop(job_id: str):
+    with tasks_lock:
+        job = group_creator_jobs.get(job_id)
+        if not job:
+            return
+        cl: Client = job["client"]
+        count = int(job["count"])
+        title_tpl = str(job["title_template"])
+        target_name = str(job["target_name"])
+        user_ids = list(job["user_ids"])
+        send_ping = bool(job["send_ping"])
+        min_cd = float(job["min_cooldown"])
+        max_cd = float(job["max_cooldown"])
+
+    for idx in range(1, count + 1):
+        if not is_creator_running(job_id):
+            log_creator(job_id, "Stopped by user")
+            return
+
+        rendered_title = title_tpl.replace("{TARGET}", target_name).replace("{N}", str(idx)).strip()
+        if not rendered_title:
+            rendered_title = f"Group {idx}"
+
+        made = False
+        for attempt in range(1, MAX_RETRIES + 1):
+            if not is_creator_running(job_id):
+                return
+            try:
+                tid_str = _create_single_group(cl, rendered_title, user_ids, send_ping)
+                log_creator(
+                    job_id,
+                    f"Created {idx}/{count} -> {tid_str}",
+                    created_id=tid_str,
+                )
+                made = True
+                break
+            except Exception as exc:
+                err_short = f"#{idx} attempt {attempt}: {str(exc)[:55]}"
+                backoff = min(300, 35 * attempt + random.uniform(5, 15))
+                log_creator(
+                    job_id,
+                    f"Rate/API backoff {backoff:.0f}s ({str(exc)[:30]})",
+                    err=err_short,
+                )
+                slept = 0.0
+                while slept < backoff and is_creator_running(job_id):
+                    step = min(1.0, backoff - slept)
+                    time.sleep(step)
+                    slept += step
+
+        if not made and is_creator_running(job_id):
+            log_creator(job_id, f"Skipped group {idx}/{count} after retries")
+
+        if idx < count and is_creator_running(job_id):
+            delay = random.uniform(min_cd, max_cd)
+            log_creator(job_id, f"Cooldown {delay:.1f}s before group {idx + 1}/{count}")
+            slept = 0.0
+            while slept < delay and is_creator_running(job_id):
+                step = min(1.0, delay - slept)
+                time.sleep(step)
+                slept += step
+
+    set_creator_running(job_id, False)
+    with tasks_lock:
+        done_n = group_creator_jobs.get(job_id, {}).get("created_count", 0)
+    log_creator(job_id, f"Completed ({done_n}/{count} created)")
+
+
 # ======================== WORKER LOOP ========================
 
 def is_task_running(task_id: str) -> bool:
@@ -488,6 +705,22 @@ class TemplateReq(BaseModel):
     group_title_template: Optional[str] = None
 
 
+class CreateGroupsReq(BaseModel):
+    username: str
+    count: int = 1
+    title_template: Optional[str] = None
+    target_name: Optional[str] = ""
+    user_ids: Optional[list[str]] = None
+    send_ping: Optional[bool] = True
+    min_cooldown: Optional[float] = 25.0
+    max_cooldown: Optional[float] = 45.0
+
+
+class InviteLinksReq(BaseModel):
+    username: str
+    thread_ids: list[str]
+
+
 # ======================== API ROUTES ========================
 
 @app.get("/api/state")
@@ -513,6 +746,20 @@ def api_state(x_panel_token: Optional[str] = Header(default=None), token: Option
             }
             for tid, info in active_tasks.items()
         ]
+        creator_view = [
+            {
+                "job_id": jid,
+                "username": j.get("username"),
+                "count": j.get("count", 0),
+                "created_count": j.get("created_count", 0),
+                "created_ids": list(j.get("created_ids", [])),
+                "running": bool(j.get("running", False)),
+                "last_event": j.get("last_event", ""),
+                "last_update": j.get("last_update", ""),
+                "errors": list(j.get("errors", []))[-5:],
+            }
+            for jid, j in group_creator_jobs.items()
+        ]
         running_count = sum(1 for t in active_tasks.values() if t.get("running"))
 
     return {
@@ -521,6 +768,7 @@ def api_state(x_panel_token: Optional[str] = Header(default=None), token: Option
         "group_title_template": get_active_group_title_template(),
         "is_custom_template": os.path.exists(TEMPLATE_FILE),
         "tasks": tasks_view,
+        "group_creator_jobs": creator_view,
         "global_messages_sent": GLOBAL_MESSAGES_SENT,
         "uptime": str(datetime.now() - BOT_START_TIME).split(".")[0],
         "stats": {
@@ -630,6 +878,94 @@ def api_threads(
         raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {str(exc)[:180]}")
 
 
+@app.post("/api/groups/create")
+def api_create_groups(
+    body: CreateGroupsReq,
+    x_panel_token: Optional[str] = Header(default=None),
+    token: Optional[str] = None,
+):
+    verify_auth(x_panel_token, token)
+    uname = body.username.strip().lstrip("@")
+    count = int(body.count or 1)
+    if not uname:
+        raise HTTPException(status_code=400, detail="Account username is required.")
+    if count < 1 or count > 50:
+        raise HTTPException(status_code=400, detail="Group count must be between 1 and 50.")
+
+    min_cd = max(10.0, float(body.min_cooldown if body.min_cooldown is not None else 25.0))
+    max_cd = max(min_cd, float(body.max_cooldown if body.max_cooldown is not None else 45.0))
+    title_tpl = (body.title_template or "").strip() or get_active_group_title_template()
+    target_name = (body.target_name or "").strip()
+    uids = parse_user_ids(body.user_ids)
+    send_ping = bool(True if body.send_ping is None else body.send_ping)
+
+    try:
+        cl = get_or_resume_client(uname)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    job_id = f"G{uuid.uuid4().hex[:6].upper()}"
+    with tasks_lock:
+        group_creator_jobs[job_id] = {
+            "job_id": job_id,
+            "client": cl,
+            "username": uname,
+            "count": count,
+            "title_template": title_tpl,
+            "target_name": target_name,
+            "user_ids": uids,
+            "send_ping": send_ping,
+            "min_cooldown": min_cd,
+            "max_cooldown": max_cd,
+            "running": True,
+            "created_count": 0,
+            "created_ids": [],
+            "errors": [],
+            "last_event": f"Queued ({count} groups, {min_cd:.0f}-{max_cd:.0f}s cd)",
+            "last_update": datetime.now().strftime("%H:%M:%S"),
+        }
+
+    threading.Thread(target=group_creator_loop, args=(job_id,), daemon=True).start()
+    return {"ok": True, "job_id": job_id, "count": count}
+
+
+@app.post("/api/groups/create/{job_id}/stop")
+def api_stop_group_creator(
+    job_id: str,
+    x_panel_token: Optional[str] = Header(default=None),
+    token: Optional[str] = None,
+):
+    verify_auth(x_panel_token, token)
+    set_creator_running(job_id, False)
+    return {"ok": True, "job_id": job_id}
+
+
+@app.post("/api/groups/invite-links")
+def api_group_invite_links(
+    body: InviteLinksReq,
+    x_panel_token: Optional[str] = Header(default=None),
+    token: Optional[str] = None,
+):
+    verify_auth(x_panel_token, token)
+    uname = body.username.strip().lstrip("@")
+    tids = parse_thread_ids(body.thread_ids)
+    if not uname or not tids:
+        raise HTTPException(status_code=400, detail="Select or enter at least 1 valid numeric GC thread ID.")
+
+    try:
+        cl = get_or_resume_client(uname)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    results = []
+    for idx, tid_str in enumerate(tids):
+        results.append(extract_group_invite_link(cl, tid_str))
+        if idx < len(tids) - 1:
+            time.sleep(random.uniform(1.5, 3.0))
+
+    return {"ok": True, "results": results}
+
+
 @app.post("/api/tasks/start")
 def api_start_task(
     body: StartTaskReq,
@@ -689,6 +1025,8 @@ def api_stop_all(x_panel_token: Optional[str] = Header(default=None), token: Opt
     with tasks_lock:
         for info in active_tasks.values():
             info["running"] = False
+        for job in group_creator_jobs.values():
+            job["running"] = False
     return {"ok": True}
 
 
@@ -743,7 +1081,7 @@ HTML_PAGE = """<!DOCTYPE html>
     }
     * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
     body { margin: 0; background: var(--bg); color: var(--text); padding: 20px; }
-    .wrap { max-width: 1080px; margin: 0 auto; display: grid; gap: 16px; }
+    .wrap { max-width: 1120px; margin: 0 auto; display: grid; gap: 16px; }
 
     @keyframes rgbShift {
       0% { background-position: 0% 50%; }
@@ -794,16 +1132,17 @@ HTML_PAGE = """<!DOCTYPE html>
     }
 
     .top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; }
-    .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 16px; }
+    .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; }
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
     h1, h2, h3 { margin: 0 0 10px; }
     h1 { font-size: 1.35rem; }
     h2 { font-size: 1.05rem; }
     label { display: block; font-size: 0.85rem; color: var(--muted); margin: 10px 0 4px; }
-    input, select {
+    input, select, textarea {
       width: 100%; background: #0d1017; color: var(--text); border: 1px solid var(--border);
       border-radius: 8px; padding: 9px 11px; font-size: 0.92rem;
     }
+    textarea { resize: vertical; min-height: 76px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem; }
     button {
       background: linear-gradient(135deg, #3b82f6, #8b5cf6); color: #fff; border: 0; border-radius: 8px;
       padding: 8px 12px; font-weight: 600; cursor: pointer; font-size: 0.85rem;
@@ -814,7 +1153,8 @@ HTML_PAGE = """<!DOCTYPE html>
     button.danger { background: var(--red); }
     button.warn { background: var(--amber); color: #111; }
     .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; align-items: center; }
-    .picker-box { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; margin-top: 8px; }
+    .two-col-inline { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .picker-box { display: flex; flex-direction: column; gap: 6px; max-height: 200px; overflow-y: auto; margin-top: 8px; }
     .pick-btn { width: 100%; text-align: left; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
     .tid-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.76rem; opacity: 0.85; word-break: break-all; }
     .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.78rem; font-weight: 600; }
@@ -823,8 +1163,10 @@ HTML_PAGE = """<!DOCTYPE html>
     .speed-badge { background: rgba(59,130,246,0.16); color: #93c5fd; }
     .nc-badge { background: rgba(245,158,11,0.16); color: #fcd34d; }
     .muted { color: var(--muted); font-size: 0.85rem; }
-    .list-item { border-top: 1px solid var(--border); padding: 10px 0; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+    .list-item { border-top: 1px solid var(--border); padding: 10px 0; display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
     .list-item:first-child { border-top: 0; }
+    .link-box { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; max-height: 200px; overflow-y: auto; }
+    .link-row { background: #0d1017; border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 0.82rem; }
     details { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 10px; }
     summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; }
     .toast { position: fixed; bottom: 18px; right: 18px; background: #1f2937; border: 1px solid var(--border); padding: 10px 14px; border-radius: 8px; display: none; z-index: 50; max-width: 420px; }
@@ -877,7 +1219,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <div class="card">
         <h2>2. Start Task & Group Selector</h2>
         <label>Account</label>
-        <select id="taskAccount"></select>
+        <select id="taskAccount" onchange="syncAccountSelectors(this.value)"></select>
 
         <div class="row">
           <button class="secondary" onclick="fetchThreads()">Load Chats / Groups</button>
@@ -894,31 +1236,104 @@ HTML_PAGE = """<!DOCTYPE html>
         <label>Target Name ({TARGET})</label>
         <input id="targetInput" placeholder="Enter target name" />
 
-        <label>Message Speed</label>
-        <select id="speedMode">
-          <option value="slow" selected>Slow (25–45s + spread, current default)</option>
-          <option value="fast">Fast (10–20s delay)</option>
-        </select>
+        <div class="two-col-inline">
+          <div>
+            <label>Message Speed</label>
+            <select id="speedMode">
+              <option value="slow" selected>Slow (25–45s + spread)</option>
+              <option value="fast">Fast (10–20s delay)</option>
+            </select>
+          </div>
+          <div>
+            <label>Name Change (NC) Mode</label>
+            <select id="ncMode">
+              <option value="true" selected>With NC (instant + 10–20m)</option>
+              <option value="false">Without NC</option>
+            </select>
+          </div>
+        </div>
 
-        <label>Name Change (NC) Mode</label>
-        <select id="ncMode">
-          <option value="true" selected>Run with NC (instant + every 10–20m)</option>
-          <option value="false">Run without NC</option>
-        </select>
-
-        <div class="muted" style="margin-top:8px;">Group title automatically updates every 10–20 minutes using the Group Title template.</div>
         <div class="row"><button onclick="startTask()">Start Task</button></div>
       </div>
     </div>
 
     <div class="grid-2">
       <div class="card">
-        <h2>3. Active Tasks</h2>
+        <h2>3. Group Chat Creator (With Cooldowns)</h2>
+        <div class="muted">Creates groups one by one with cooldowns to avoid API limits. Supports <code>{TARGET}</code> and <code>{N}</code>.</div>
+        <label>Account</label>
+        <select id="gcCreatorAccount"></select>
+
+        <div class="two-col-inline">
+          <div>
+            <label>Number of Groups to Create</label>
+            <input id="gcCreateCount" type="number" min="1" max="50" value="3" />
+          </div>
+          <div>
+            <label>Target Name ({TARGET})</label>
+            <input id="gcCreateTarget" placeholder="Optional target name" />
+          </div>
+        </div>
+
+        <label>Group Title Template</label>
+        <input id="gcCreateTitle" type="text" placeholder="{TARGET} #{N}" />
+
+        <label>Extra User IDs (optional comma-separated numeric IG user IDs)</label>
+        <input id="gcCreateUsers" type="text" placeholder="Leave blank to create with your account" />
+
+        <div class="two-col-inline">
+          <div>
+            <label>Min Cooldown (sec)</label>
+            <input id="gcMinCd" type="number" min="10" value="25" />
+          </div>
+          <div>
+            <label>Max Cooldown (sec)</label>
+            <input id="gcMaxCd" type="number" min="10" value="45" />
+          </div>
+        </div>
+
+        <label>Initial Message After Creation</label>
+        <select id="gcSendPing">
+          <option value="true" selected>Send welcome ping so GC appears in inbox</option>
+          <option value="false">Do not send initial message</option>
+        </select>
+
+        <div class="row">
+          <button onclick="startGroupCreator()">Start Creating Groups</button>
+          <button class="secondary" onclick="useCreatedIdsForTask()">Use Created IDs in Task</button>
+        </div>
+
+        <div id="creatorJobsList" class="muted" style="margin-top:10px;">No group creation jobs yet.</div>
+      </div>
+
+      <div class="card">
+        <h2>4. Mobile Group Invite Link Extractor</h2>
+        <div class="muted">Extracts mobile invite links for the selected/entered group IDs above.</div>
+        <label>Account</label>
+        <select id="inviteAccount"></select>
+
+        <label>Group Thread IDs to Extract (uses Selected Thread IDs if left blank)</label>
+        <input id="inviteThreadIds" type="text" placeholder="Leave blank to use Selected Thread IDs" />
+
+        <div class="row">
+          <button onclick="extractInviteLinks()">Extract Invite Links</button>
+          <button class="secondary" onclick="copyExtractedLinks()">Copy Links</button>
+        </div>
+
+        <div id="inviteLinksResult" class="link-box">
+          <div class="muted">No invite links extracted yet.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <h2>5. Active Tasks</h2>
         <div id="tasksList" class="muted">No tasks yet.</div>
       </div>
 
       <div class="card">
-        <h2>4. Message & Group Rename Templates</h2>
+        <h2>6. Message & Group Rename Templates</h2>
         <div class="muted">Enter <strong>one line</strong> using <code>{TARGET}</code>. Picks a random emoji for <code>-🌒-</code> on each of the 11 lines.</div>
         <label>Single Line Message Template</label>
         <input id="templateLineInput" type="text" placeholder="<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> -🌒-" />
@@ -940,6 +1355,8 @@ HTML_PAGE = """<!DOCTYPE html>
     const TOKEN_KEY = "ig_panel_token";
     document.getElementById("tokenInput").value = localStorage.getItem(TOKEN_KEY) || "";
     let loadedThreads = [];
+    let latestCreatedIds = [];
+    let latestExtractedLinks = [];
 
     function showToast(msg, err = false) {
       const el = document.getElementById("toast");
@@ -972,11 +1389,25 @@ HTML_PAGE = """<!DOCTYPE html>
       return { status: res.status, data };
     }
 
-    function getSelectedThreadStrings() {
-      return document.getElementById("threadIdsInput").value
+    function syncAccountSelectors(val) {
+      if (!val) return;
+      for (const id of ["taskAccount", "gcCreatorAccount", "inviteAccount"]) {
+        const el = document.getElementById(id);
+        if (el && Array.from(el.options).some(o => o.value === val)) {
+          el.value = val;
+        }
+      }
+    }
+
+    function parseThreadStringList(rawStr) {
+      return String(rawStr || "")
         .split(",")
         .map(s => s.trim())
         .filter(s => /^\d+$/.test(s));
+    }
+
+    function getSelectedThreadStrings() {
+      return parseThreadStringList(document.getElementById("threadIdsInput").value);
     }
 
     function renderThreadPicker() {
@@ -1032,10 +1463,12 @@ HTML_PAGE = """<!DOCTYPE html>
           `CPU ${s.cpu_percent}% · RAM ${s.ram_percent}% (${s.ram_used_gb}/${s.ram_total_gb} GB) · RSS ${s.rss_mb} MB · Sent ${data.global_messages_sent} · Uptime ${data.uptime}`;
 
         const accs = Object.keys(data.accounts || {});
-        const sel = document.getElementById("taskAccount");
-        const prev = sel.value;
-        sel.innerHTML = accs.map(u => `<option value="${escapeHtml(u)}">@${escapeHtml(u)}</option>`).join("");
-        if (accs.includes(prev)) sel.value = prev;
+        for (const id of ["taskAccount", "gcCreatorAccount", "inviteAccount"]) {
+          const sel = document.getElementById(id);
+          const prev = sel.value;
+          sel.innerHTML = accs.map(u => `<option value="${escapeHtml(u)}">@${escapeHtml(u)}</option>`).join("");
+          if (accs.includes(prev)) sel.value = prev;
+        }
 
         const accBox = document.getElementById("accountsList");
         if (!accs.length) {
@@ -1065,6 +1498,35 @@ HTML_PAGE = """<!DOCTYPE html>
                 <div class="muted">Sent: ${t.msg_count} · ${escapeHtml(t.last_event || "Idle")} (${escapeHtml(t.last_update || "")})</div>
               </div>
               ${t.running ? `<button class="danger" onclick="stopTask('${escapeHtml(t.task_id)}')">Stop</button>` : ""}
+            </div>
+          `).join("");
+        }
+
+        const cBox = document.getElementById("creatorJobsList");
+        const jobs = data.group_creator_jobs || [];
+        if (!jobs.length) {
+          cBox.innerHTML = `<div class="muted">No group creation jobs yet.</div>`;
+        } else {
+          const allIds = [];
+          for (const j of jobs) {
+            for (const cid of (j.created_ids || [])) {
+              if (!allIds.includes(String(cid))) allIds.push(String(cid));
+            }
+          }
+          latestCreatedIds = allIds;
+
+          cBox.innerHTML = jobs.map(j => `
+            <div class="list-item">
+              <div>
+                <div><strong>${escapeHtml(j.job_id)}</strong> · @${escapeHtml(j.username)} · <strong>${j.created_count}/${j.count}</strong> created
+                  <span class="badge ${j.running ? "on" : "off"}">${j.running ? "CREATING" : "DONE"}</span>
+                </div>
+                <div class="muted">${escapeHtml(j.last_event || "")} (${escapeHtml(j.last_update || "")})</div>
+                ${(j.created_ids && j.created_ids.length)
+                  ? `<div class="tid-mono" style="margin-top:4px;">IDs: ${escapeHtml(j.created_ids.join(", "))}</div>`
+                  : ""}
+              </div>
+              ${j.running ? `<button class="danger" onclick="stopGroupCreator('${escapeHtml(j.job_id)}')">Stop</button>` : ""}
             </div>
           `).join("");
         }
@@ -1147,6 +1609,85 @@ HTML_PAGE = """<!DOCTYPE html>
       } catch (e) { showToast(e.message, true); }
     }
 
+    async function startGroupCreator() {
+      try {
+        const username = document.getElementById("gcCreatorAccount").value;
+        const count = parseInt(document.getElementById("gcCreateCount").value, 10) || 1;
+        const target_name = document.getElementById("gcCreateTarget").value.trim() || document.getElementById("targetInput").value.trim();
+        const title_template = document.getElementById("gcCreateTitle").value.trim() || null;
+        const user_ids = document.getElementById("gcCreateUsers").value
+          .split(",").map(s => s.trim()).filter(s => /^\d+$/.test(s));
+        const min_cooldown = parseFloat(document.getElementById("gcMinCd").value) || 25;
+        const max_cooldown = parseFloat(document.getElementById("gcMaxCd").value) || 45;
+        const send_ping = document.getElementById("gcSendPing").value === "true";
+
+        const { data } = await api("/api/groups/create", "POST", {
+          username, count, title_template, target_name, user_ids, min_cooldown, max_cooldown, send_ping
+        });
+        showToast(`Started group creator ${data.job_id} (${data.count} groups)`);
+        refreshState();
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function stopGroupCreator(jobId) {
+      try {
+        await api(`/api/groups/create/${encodeURIComponent(jobId)}/stop`, "POST");
+        showToast(`Stopped creator ${jobId}`);
+        refreshState();
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    function useCreatedIdsForTask() {
+      if (!latestCreatedIds.length) return showToast("No created group IDs yet", true);
+      document.getElementById("threadIdsInput").value = latestCreatedIds.join(", ");
+      renderThreadPicker();
+      showToast(`Loaded ${latestCreatedIds.length} created group IDs`);
+    }
+
+    async function extractInviteLinks() {
+      try {
+        const username = document.getElementById("inviteAccount").value;
+        const customRaw = document.getElementById("inviteThreadIds").value.trim();
+        const thread_ids = customRaw ? parseThreadStringList(customRaw) : getSelectedThreadStrings();
+        if (!thread_ids.length) {
+          return showToast("Select or enter at least 1 valid group ID first", true);
+        }
+
+        const resBox = document.getElementById("inviteLinksResult");
+        resBox.innerHTML = `<div class="muted">Extracting links for ${thread_ids.length} thread(s)...</div>`;
+
+        const { data } = await api("/api/groups/invite-links", "POST", { username, thread_ids });
+        latestExtractedLinks = Array.isArray(data.results) ? data.results : [];
+
+        resBox.innerHTML = latestExtractedLinks.map(r => {
+          if (r.invite_link) {
+            return `<div class="link-row">
+              <div><strong>${escapeHtml(r.title)}</strong> <span class="tid-mono">(${escapeHtml(r.thread_id)})</span></div>
+              <div class="tid-mono" style="margin-top:4px; color:#6ee7b7;">${escapeHtml(r.invite_link)}</div>
+            </div>`;
+          }
+          return `<div class="link-row">
+            <div><strong>${escapeHtml(r.title)}</strong> <span class="tid-mono">(${escapeHtml(r.thread_id)})</span></div>
+            <div class="muted" style="margin-top:3px;">${escapeHtml(r.status || "No link returned")}</div>
+          </div>`;
+        }).join("");
+
+        const okCount = latestExtractedLinks.filter(x => x.invite_link).length;
+        showToast(`Extracted ${okCount}/${latestExtractedLinks.length} invite links`);
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function copyExtractedLinks() {
+      const links = latestExtractedLinks.map(x => x.invite_link).filter(Boolean);
+      if (!links.length) return showToast("No extracted invite links to copy", true);
+      try {
+        await navigator.clipboard.writeText(links.join("\\n"));
+        showToast(`Copied ${links.length} invite link(s)`);
+      } catch (_) {
+        showToast("Clipboard blocked—copy directly from the list above", true);
+      }
+    }
+
     async function stopTask(id) {
       try {
         await api(`/api/tasks/${encodeURIComponent(id)}/stop`, "POST");
@@ -1158,7 +1699,7 @@ HTML_PAGE = """<!DOCTYPE html>
     async function stopAll() {
       try {
         await api("/api/tasks/stop-all", "POST");
-        showToast("Stopped all tasks");
+        showToast("Stopped all tasks & creators");
         refreshState();
       } catch (e) { showToast(e.message, true); }
     }
