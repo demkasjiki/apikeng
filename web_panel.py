@@ -16,7 +16,7 @@ import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from instagrapi import Client
-from instagrapi.exceptions import BadPassword, TwoFactorRequired
+from instagrapi.exceptions import BadPassword, ClientNeedsUpgradeError, TwoFactorRequired
 from pydantic import BaseModel
 
 # ======================== CONFIG ========================
@@ -24,11 +24,11 @@ from pydantic import BaseModel
 PORT = int(os.environ.get("PORT", "8000"))
 PANEL_TOKEN = os.environ.get("PANEL_TOKEN", "").strip()
 
-IG_APP_VERSION = os.environ.get("IG_APP_VERSION", "345.0.0.25.107").strip()
-IG_VERSION_CODE = os.environ.get("IG_VERSION_CODE", "636942882").strip()
+IG_APP_VERSION = os.environ.get("IG_APP_VERSION", "355.0.0.47.96").strip()
+IG_VERSION_CODE = os.environ.get("IG_VERSION_CODE", "656018442").strip()
 IG_USER_AGENT = os.environ.get(
     "IG_USER_AGENT",
-    f"Instagram {IG_APP_VERSION} Android (33/13; 420dpi; 1080x2400; samsung; SM-G991B; o1s; exynos2100; en_US; {IG_VERSION_CODE})",
+    f"Instagram {IG_APP_VERSION} Android (34/14; 480dpi; 1080x2400; samsung; SM-S918B; dm3q; qcom; en_US; {IG_VERSION_CODE})",
 ).strip()
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else "./data")
@@ -593,8 +593,16 @@ def api_login_password(
         )
     except BadPassword:
         raise HTTPException(status_code=401, detail="Incorrect Instagram password.")
+    except ClientNeedsUpgradeError:
+        raise HTTPException(
+            status_code=400,
+            detail="Instagram rejected app version (ClientNeedsUpgradeError). Upgrade instagrapi, set IG_APP_VERSION / IG_VERSION_CODE, or use Session ID fallback.",
+        )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {str(exc)[:180]}")
+        msg = str(exc)
+        if "out of date" in msg.lower() or "upgrade your app" in msg.lower():
+            msg = f"{msg} — Upgrade instagrapi or set IG_APP_VERSION / IG_VERSION_CODE, or use Session ID fallback."
+        raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {msg[:200]}")
 
 
 @app.delete("/api/accounts/{username}")
@@ -723,11 +731,11 @@ HTML_PAGE = """<!DOCTYPE html>
   <title>ρ 𝕣 ꪜ 𝕣 अब्बू ☽ · IG Web Controller</title>
   <style>
     :root {
-      --bg: #0f1117;
-      --card: #181c24;
-      --border: #2a303c;
-      --text: #e6edf3;
-      --muted: #8b949e;
+      --bg: #0b0d14;
+      --card: #151923;
+      --border: #272e3f;
+      --text: #eef2ff;
+      --muted: #94a3b8;
       --accent: #3b82f6;
       --green: #22c55e;
       --red: #ef4444;
@@ -736,23 +744,55 @@ HTML_PAGE = """<!DOCTYPE html>
     * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
     body { margin: 0; background: var(--bg); color: var(--text); padding: 20px; }
     .wrap { max-width: 1080px; margin: 0 auto; display: grid; gap: 16px; }
+
+    @keyframes rgbShift {
+      0% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+    @keyframes pulseGlow {
+      0%, 100% {
+        box-shadow: 0 0 22px rgba(236, 72, 153, 0.35), 0 0 42px rgba(59, 130, 246, 0.25);
+        transform: translateY(0px);
+      }
+      50% {
+        box-shadow: 0 0 30px rgba(34, 211, 238, 0.45), 0 0 54px rgba(168, 85, 247, 0.35);
+        transform: translateY(-1px);
+      }
+    }
+
     .hero-banner {
-      background: linear-gradient(135deg, #1b2234 0%, #151923 55%, #1f1b2e 100%);
-      border: 1px solid #334155;
+      position: relative;
+      border-radius: 16px;
+      padding: 2px;
+      background: linear-gradient(120deg, #ff2a85, #ff8a00, #ffd600, #00f5a0, #00d9f5, #8b5cf6, #ff2a85);
+      background-size: 300% 300%;
+      animation: rgbShift 6s ease infinite, pulseGlow 3.2s ease-in-out infinite;
+    }
+    .hero-banner-inner {
+      background: radial-gradient(circle at 20% 20%, rgba(236, 72, 153, 0.22), transparent 45%),
+                  radial-gradient(circle at 80% 30%, rgba(34, 211, 238, 0.22), transparent 45%),
+                  radial-gradient(circle at 50% 90%, rgba(168, 85, 247, 0.24), transparent 55%),
+                  #0e111b;
       border-radius: 14px;
-      padding: 22px 20px;
+      padding: 24px 20px;
       text-align: center;
-      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
     }
     .hero-banner-text {
-      font-size: clamp(1.8rem, 4.5vw, 3rem);
-      font-weight: 800;
-      letter-spacing: 0.04em;
+      font-size: clamp(2rem, 5vw, 3.25rem);
+      font-weight: 900;
+      letter-spacing: 0.05em;
       line-height: 1.2;
-      color: #f8fafc;
-      text-shadow: 0 2px 18px rgba(59, 130, 246, 0.35);
+      background: linear-gradient(90deg, #ff4ecd, #ffbe0b, #00f5d4, #4cc9f0, #c77dff, #ff4ecd);
+      background-size: 250% 250%;
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+      animation: rgbShift 5s linear infinite;
+      filter: drop-shadow(0 0 14px rgba(236, 72, 153, 0.35));
       word-break: break-word;
     }
+
     .top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; }
     .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 16px; }
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
@@ -765,12 +805,12 @@ HTML_PAGE = """<!DOCTYPE html>
       border-radius: 8px; padding: 9px 11px; font-size: 0.92rem;
     }
     button {
-      background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+      background: linear-gradient(135deg, #3b82f6, #8b5cf6); color: #fff; border: 0; border-radius: 8px;
       padding: 8px 12px; font-weight: 600; cursor: pointer; font-size: 0.85rem;
     }
     button:hover { opacity: 0.92; }
-    button.secondary { background: #262c3a; color: var(--text); }
-    button.picked { background: #1d4ed8; border: 1px solid #60a5fa; color: #fff; }
+    button.secondary { background: #242b3d; color: var(--text); }
+    button.picked { background: linear-gradient(135deg, #ec4899, #8b5cf6); border: 1px solid #f472b6; color: #fff; }
     button.danger { background: var(--red); }
     button.warn { background: var(--amber); color: #111; }
     .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; align-items: center; }
@@ -787,13 +827,15 @@ HTML_PAGE = """<!DOCTYPE html>
     .list-item:first-child { border-top: 0; }
     details { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 10px; }
     summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; }
-    .toast { position: fixed; bottom: 18px; right: 18px; background: #1f2937; border: 1px solid var(--border); padding: 10px 14px; border-radius: 8px; display: none; z-index: 50; }
+    .toast { position: fixed; bottom: 18px; right: 18px; background: #1f2937; border: 1px solid var(--border); padding: 10px 14px; border-radius: 8px; display: none; z-index: 50; max-width: 420px; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="hero-banner">
-      <div class="hero-banner-text">ρ 𝕣 ꪜ 𝕣 अब्बू ☽</div>
+      <div class="hero-banner-inner">
+        <div class="hero-banner-text">ρ 𝕣 ꪜ 𝕣 अब्बू ☽</div>
+      </div>
     </div>
 
     <div class="top">
@@ -905,7 +947,7 @@ HTML_PAGE = """<!DOCTYPE html>
       el.style.borderColor = err ? "#ef4444" : "#22c55e";
       el.style.display = "block";
       clearTimeout(window._t);
-      window._t = setTimeout(() => { el.style.display = "none"; }, 3200);
+      window._t = setTimeout(() => { el.style.display = "none"; }, 4500);
     }
 
     function saveToken() {
