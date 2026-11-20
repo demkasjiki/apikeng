@@ -3,13 +3,16 @@
 
 import os
 import re
+import sys
 import json
 import time
 import uuid
 import random
 import hashlib
 import inspect
+import traceback
 import threading
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
@@ -46,11 +49,10 @@ os.makedirs(DATA_DIR, exist_ok=True)
 ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
 TEMPLATE_FILE = os.path.join(DATA_DIR, "template.json")
 WS_SESSIONS_FILE = os.path.join(DATA_DIR, "ws_sessions.json")
+CRASH_LOG_FILE = os.path.join(DATA_DIR, "panel_crash.log")
 
 DEFAULT_SINGLE_LINE_TEMPLATE = "<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> -🌒-"
 DEFAULT_GROUP_TITLE_TEMPLATE = "{TARGET}"
-# 11 lines matching the exact line count and blank-line gaps of the original BASE_TEMPLATE:
-# 5 blank lines after lines 1, 2, 3; 6 blank lines after lines 4..10; no trailing blank lines after line 11.
 LINE_GAPS_AFTER = [6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 1]
 
 EMOJI_POOL = [
@@ -111,10 +113,57 @@ pending_2fa: dict = {}
 tasks_lock = threading.Lock()
 ws_lock = threading.Lock()
 store_lock = threading.Lock()
+log_lock = threading.Lock()
+LIVE_LOGS = deque(maxlen=250)
 GLOBAL_MESSAGES_SENT = 0
 BOT_START_TIME = datetime.now()
 
+
+# ======================== IN-PANEL & FILE LOGGING ========================
+
+def record_log(level: str, source: str, message: str, persist: bool = False):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"[{ts}] [{level.upper()}] [{source}] {message}"
+    with log_lock:
+        LIVE_LOGS.append(entry)
+    print(entry, flush=True)
+    if persist:
+        try:
+            with open(CRASH_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(entry + "\n")
+        except Exception:
+            pass
+
+
+def _install_global_excepthooks():
+    def _sys_hook(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        tb_str = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))[-1500:]
+        record_log("ERROR", "SYS_UNCAUGHT", f"{exc_type.__name__}: {exc_value}\n{tb_str}", persist=True)
+
+    def _thread_hook(args):
+        if issubclass(args.exc_type, SystemExit):
+            return
+        tname = getattr(args.thread, "name", "unknown")
+        tb_str = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))[-1500:]
+        record_log("ERROR", f"THREAD:{tname}", f"{args.exc_type.__name__}: {args.exc_value}\n{tb_str}", persist=True)
+
+    sys.excepthook = _sys_hook
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = _thread_hook
+
+
+_install_global_excepthooks()
+
 app = FastAPI(title="IG Web Controller")
+
+
+@app.exception_handler(Exception)
+async def global_http_exception_handler(request: Request, exc: Exception):
+    record_log("ERROR", f"HTTP:{request.url.path}", f"{type(exc).__name__}: {str(exc)[:250]}", persist=True)
+    return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {str(exc)[:200]}"})
 
 
 # ======================== AUTH HELPER ========================
@@ -258,7 +307,7 @@ def save_ws_sessions_disk():
             with open(WS_SESSIONS_FILE, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
         except Exception as exc:
-            print(f"[WS] Disk save error: {exc}", flush=True)
+            record_log("WARN", "WS_DISK", f"Disk save error: {exc}")
 
 
 def load_ws_sessions_disk() -> dict:
@@ -535,6 +584,26 @@ def clamp_socket_count(n: int) -> int:
     return max(1, min(10, int(n)))
 
 
+def _safe_disconnect_socket(sock, tag: str = "sock"):
+    if sock is None:
+        return
+    try:
+        sock.disconnect()
+    except BaseException as exc:
+        record_log("WARN", f"WS_DISC:{tag}", f"Ignored disconnect error: {type(exc).__name__}: {str(exc)[:100]}")
+
+
+def _detach_and_close_socket(sock, tag: str = "sock"):
+    if sock is None:
+        return
+    threading.Thread(
+        target=_safe_disconnect_socket,
+        args=(sock, tag),
+        name=f"ws-close-{tag}",
+        daemon=True,
+    ).start()
+
+
 class WsSessionWorker:
     def __init__(self, data: dict):
         self.data = dict(data)
@@ -554,6 +623,7 @@ class WsSessionWorker:
         self.sockets = []
         self.socket_locks = []
         self._streak_false = []
+        self._sock_backoff_until = []
         self._pool_resize_lock = threading.Lock()
 
         self._rr_sock_idx = 0
@@ -632,11 +702,16 @@ class WsSessionWorker:
                             user_agent=self.data["ua"],
                         )
                     s.connect(dm_receive=mode)
-                    lt = threading.Thread(target=self._listen_loop, args=(s,), daemon=True)
+                    lt = threading.Thread(
+                        target=self._listen_loop,
+                        args=(s, label),
+                        name=f"ws-listen-{label}",
+                        daemon=True,
+                    )
                     lt.start()
                     self.listen_threads.append(lt)
                     return s
-                except Exception as exc:
+                except BaseException as exc:
                     err = exc
                     if "connack" in str(exc).lower():
                         time.sleep(min(0.4, retry_delay))
@@ -645,16 +720,17 @@ class WsSessionWorker:
                 time.sleep(min(0.6, retry_delay))
         raise RuntimeError(f"{label}: {err}")
 
-    def _listen_loop(self, sock):
+    def _listen_loop(self, sock, label: str = "sock"):
         try:
             sock.listen()
-        except Exception as exc:
-            print(f"[WS:{self.data.get('session_name', '?')}] listen error: {str(exc)[:100]}", flush=True)
+        except BaseException as exc:
+            record_log("WARN", f"WS_LISTEN:{self.data.get('session_name', '?')}:{label}", f"{type(exc).__name__}: {str(exc)[:120]}")
 
     def _init_pool_arrays(self, n: int):
         self.sockets = [None] * n
         self.socket_locks = [threading.Lock() for _ in range(n)]
         self._streak_false = [0] * n
+        self._sock_backoff_until = [0.0] * n
         self.pool_size = n
 
     def _connect_slot_worker(self, idx: int, label: str):
@@ -664,9 +740,10 @@ class WsSessionWorker:
             time.sleep(0.15 * idx)
         try:
             return self._connect(label, max_retries=2, retry_delay=0.6)
-        except Exception as exc:
+        except BaseException as exc:
             with self._stats_lock:
                 self.stats["last_error"] = f"{label}: {str(exc)[:80]}"
+            record_log("WARN", f"WS_SEED:{label}", str(exc)[:140])
             return None
 
     def _seed_pool(self) -> int:
@@ -676,7 +753,10 @@ class WsSessionWorker:
         with ThreadPoolExecutor(max_workers=n) as pool:
             futures = {pool.submit(self._connect_slot_worker, i, f"pool{i}"): i for i in range(n)}
             for fut, i in futures.items():
-                s = fut.result()
+                try:
+                    s = fut.result()
+                except BaseException:
+                    s = None
                 if s is not None and i < len(self.sockets):
                     with self.socket_locks[i]:
                         self.sockets[i] = s
@@ -704,23 +784,22 @@ class WsSessionWorker:
                 self.sockets = self.sockets[:target]
                 self.socket_locks = self.socket_locks[:target]
                 self._streak_false = self._streak_false[:target]
+                self._sock_backoff_until = self._sock_backoff_until[:target]
                 self.pool_size = target
-                for s in removed:
-                    if s is not None:
-                        try:
-                            s.disconnect()
-                        except Exception:
-                            pass
+                for idx_r, s in enumerate(removed):
+                    _detach_and_close_socket(s, f"shrink{target + idx_r}")
             else:
                 extra = target - current
                 self.socket_locks.extend(threading.Lock() for _ in range(extra))
                 self._streak_false.extend([0] * extra)
+                self._sock_backoff_until.extend([0.0] * extra)
                 self.sockets.extend([None] * extra)
                 self.pool_size = target
                 if not self.stop_event.is_set():
                     threading.Thread(
                         target=self._grow_pool_async,
                         args=(current, target),
+                        name="ws-grow-pool",
                         daemon=True,
                     ).start()
 
@@ -737,11 +816,8 @@ class WsSessionWorker:
                         self.sockets[i] = sock
                         sock = None
                 if sock is not None:
-                    try:
-                        sock.disconnect()
-                    except Exception:
-                        pass
-            except Exception as exc:
+                    _detach_and_close_socket(sock, f"grow-discard{i}")
+            except BaseException as exc:
                 with self._stats_lock:
                     self.stats["last_error"] = f"grow@{i}: {str(exc)[:80]}"
 
@@ -764,7 +840,7 @@ class WsSessionWorker:
 
         for lt in list(self.listen_threads):
             if lt.is_alive():
-                lt.join(timeout=2)
+                lt.join(timeout=1)
 
         with self._inflight_lock:
             self._inflight = 0
@@ -776,10 +852,11 @@ class WsSessionWorker:
 
         try:
             ok = self._seed_pool()
-        except Exception as exc:
+        except BaseException as exc:
             with self._stats_lock:
                 self.stats["status"] = "error"
                 self.stats["last_error"] = str(exc)[:100]
+            record_log("ERROR", f"WS_START:{self.data.get('session_name', '?')}", str(exc)[:160], persist=True)
             return False, str(exc)[:100]
 
         with self._stats_lock:
@@ -795,17 +872,18 @@ class WsSessionWorker:
                 "session_error": None,
             })
 
-        self.msg_thread = threading.Thread(target=self._msg_loop, daemon=True)
-        self.watchdog_thread = threading.Thread(target=self._pool_watchdog_loop, daemon=True)
-        self.rotate_thread = threading.Thread(target=self._ws_rotate_loop, daemon=True)
-        self.health_thread = threading.Thread(target=self._health_check_loop, daemon=True)
+        record_log("INFO", f"WS_START:{self.data.get('session_name', '?')}", f"Live with {ok}/{self.pool_size} sockets")
+        self.msg_thread = threading.Thread(target=self._msg_loop, name="ws-msg-loop", daemon=True)
+        self.watchdog_thread = threading.Thread(target=self._pool_watchdog_loop, name="ws-watchdog", daemon=True)
+        self.rotate_thread = threading.Thread(target=self._ws_rotate_loop, name="ws-rotate", daemon=True)
+        self.health_thread = threading.Thread(target=self._health_check_loop, name="ws-health", daemon=True)
         self.msg_thread.start()
         self.watchdog_thread.start()
         self.rotate_thread.start()
         self.health_thread.start()
 
         if bool(self.data.get("use_nc", True)):
-            self.rename_thread = threading.Thread(target=self._rename_loop, daemon=True)
+            self.rename_thread = threading.Thread(target=self._rename_loop, name="ws-rename", daemon=True)
             self.rename_thread.start()
 
         return True, None
@@ -815,93 +893,102 @@ class WsSessionWorker:
         with self._pool_resize_lock:
             socks = list(self.sockets)
             self.sockets = []
-        for s in socks:
-            if s is not None:
-                try:
-                    s.disconnect()
-                except Exception:
-                    pass
+        for idx, s in enumerate(socks):
+            _detach_and_close_socket(s, f"stop{idx}")
         with self._stats_lock:
             self.stats["status"] = "stopped"
+        record_log("INFO", f"WS_STOP:{self.data.get('session_name', '?')}", "Stopped")
 
     def _evict_socket(self, idx: int):
-        with self._pool_resize_lock:
-            if idx < 0 or idx >= len(self.sockets):
-                return
-            with self.socket_locks[idx]:
-                old = self.sockets[idx]
-                self.sockets[idx] = None
-                if idx < len(self._streak_false):
-                    self._streak_false[idx] = 0
-        if old:
-            try:
-                old.disconnect()
-            except Exception:
-                pass
+        old = None
+        try:
+            with self._pool_resize_lock:
+                if idx < 0 or idx >= len(self.sockets):
+                    return
+                with self.socket_locks[idx]:
+                    old = self.sockets[idx]
+                    self.sockets[idx] = None
+                    if idx < len(self._streak_false):
+                        self._streak_false[idx] = 0
+                    if idx < len(self._sock_backoff_until):
+                        self._sock_backoff_until[idx] = 0.0
+        except BaseException as exc:
+            record_log("WARN", f"WS_EVICT:{idx}", f"Lock/evict error: {exc}")
+        if old is not None:
+            _detach_and_close_socket(old, f"evict{idx}")
 
     def _ws_rotate_loop(self):
         while not self.stop_event.is_set():
-            interval = random.uniform(max(60.0, WS_ROTATE_MIN), max(120.0, WS_ROTATE_MAX))
-            if self.stop_event.wait(interval):
-                break
-            with self._pool_resize_lock:
-                n = len(self.sockets)
-            for i in range(n):
-                if self.stop_event.is_set():
+            try:
+                interval = random.uniform(max(60.0, WS_ROTATE_MIN), max(120.0, WS_ROTATE_MAX))
+                if self.stop_event.wait(interval):
                     break
-                self._evict_socket(i)
-                with self._stats_lock:
-                    self.stats["rotations"] += 1
-                self.stop_event.wait(0.3)
+                with self._pool_resize_lock:
+                    n = len(self.sockets)
+                for i in range(n):
+                    if self.stop_event.is_set():
+                        break
+                    self._evict_socket(i)
+                    with self._stats_lock:
+                        self.stats["rotations"] += 1
+                    self.stop_event.wait(0.3)
+            except BaseException as exc:
+                record_log("WARN", "WS_ROTATE", f"Loop error: {exc}")
+                self.stop_event.wait(5.0)
 
     def _health_check_loop(self):
         while not self.stop_event.is_set():
-            interval = random.uniform(max(30.0, WS_HEALTH_CHECK_MIN), max(60.0, WS_HEALTH_CHECK_MAX))
-            if self.stop_event.wait(interval):
-                break
-            with self._pool_resize_lock:
-                n = len(self.sockets)
-            for i in range(n):
-                if self.stop_event.is_set() or i >= len(self.sockets):
+            try:
+                interval = random.uniform(max(30.0, WS_HEALTH_CHECK_MIN), max(60.0, WS_HEALTH_CHECK_MAX))
+                if self.stop_event.wait(interval):
                     break
-                with self.socket_locks[i]:
-                    sock = self.sockets[i]
-                    streak = self._streak_false[i] if i < len(self._streak_false) else 0
-                if sock is None or streak >= 3:
-                    self._evict_socket(i)
+                with self._pool_resize_lock:
+                    n = len(self.sockets)
+                for i in range(n):
+                    if self.stop_event.is_set() or i >= len(self.sockets):
+                        break
+                    with self.socket_locks[i]:
+                        sock = self.sockets[i]
+                        streak = self._streak_false[i] if i < len(self._streak_false) else 0
+                    if sock is None or streak >= 3:
+                        self._evict_socket(i)
+            except BaseException as exc:
+                record_log("WARN", "WS_HEALTH", f"Loop error: {exc}")
+                self.stop_event.wait(5.0)
 
     def _pool_watchdog_loop(self):
         while not self.stop_event.is_set():
-            if self.stop_event.wait(WS_POOL_WATCHDOG_SEC):
-                break
-            with self._pool_resize_lock:
-                n = len(self.sockets)
-            for i in range(n):
-                if self.stop_event.is_set():
+            try:
+                if self.stop_event.wait(WS_POOL_WATCHDOG_SEC):
                     break
                 with self._pool_resize_lock:
-                    if i >= len(self.sockets):
+                    n = len(self.sockets)
+                for i in range(n):
+                    if self.stop_event.is_set():
                         break
-                    lock_i = self.socket_locks[i]
-                    with lock_i:
-                        needs_connect = self.sockets[i] is None
-                if needs_connect:
-                    try:
-                        new_sock = self._connect(f"wd{i}", max_retries=2, retry_delay=0.6)
-                        with self._pool_resize_lock:
-                            if i < len(self.sockets):
-                                with self.socket_locks[i]:
-                                    if self.sockets[i] is None:
-                                        self.sockets[i] = new_sock
-                                        new_sock = None
-                        if new_sock is not None:
-                            try:
-                                new_sock.disconnect()
-                            except Exception:
-                                pass
-                    except Exception as exc:
-                        with self._stats_lock:
-                            self.stats["last_error"] = f"wd@{i}: {str(exc)[:80]}"
+                    with self._pool_resize_lock:
+                        if i >= len(self.sockets):
+                            break
+                        lock_i = self.socket_locks[i]
+                        with lock_i:
+                            needs_connect = self.sockets[i] is None
+                    if needs_connect:
+                        try:
+                            new_sock = self._connect(f"wd{i}", max_retries=2, retry_delay=0.6)
+                            with self._pool_resize_lock:
+                                if i < len(self.sockets):
+                                    with self.socket_locks[i]:
+                                        if self.sockets[i] is None:
+                                            self.sockets[i] = new_sock
+                                            new_sock = None
+                            if new_sock is not None:
+                                _detach_and_close_socket(new_sock, f"wd-discard{i}")
+                        except BaseException as exc:
+                            with self._stats_lock:
+                                self.stats["last_error"] = f"wd@{i}: {str(exc)[:80]}"
+            except BaseException as exc:
+                record_log("WARN", "WS_WATCHDOG", f"Loop error: {exc}")
+                self.stop_event.wait(2.0)
 
     def _pick_thread_id(self) -> Optional[str]:
         tids = self._get_target_threads()
@@ -913,42 +1000,46 @@ class WsSessionWorker:
         return tid
 
     def _msg_loop(self):
-        self._executor = ThreadPoolExecutor(max_workers=16)
+        self._executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="ws-send")
         next_fire = time.monotonic()
 
         try:
             while not self.stop_event.is_set():
-                d_min = max(WS_MIN_SAFE_MSG_DELAY, float(self.data.get("delay_min", WS_DEFAULT_DELAY_MIN)))
-                d_max = max(d_min, float(self.data.get("delay_max", WS_DEFAULT_DELAY_MAX)))
-                interval = random.uniform(d_min, d_max)
-
-                with self._pool_resize_lock:
-                    live = sum(1 for s in self.sockets if s is not None)
-                max_inflight = max(4, live * 4) if live > 0 else 2
-
-                now = time.monotonic()
-                max_debt = max(0.3, interval * 2)
-                if next_fire < now - max_debt:
-                    next_fire = now
-
-                wait = next_fire - now
-                if wait > 0 and self.stop_event.wait(wait):
-                    break
-
-                with self._inflight_lock:
-                    if self._inflight >= max_inflight:
-                        next_fire = time.monotonic() + min(interval, 0.1)
-                        continue
-                    self._inflight += 1
-
                 try:
-                    self._executor.submit(self._fire_message_rr)
-                except RuntimeError:
-                    with self._inflight_lock:
-                        self._inflight -= 1
-                    break
+                    d_min = max(WS_MIN_SAFE_MSG_DELAY, float(self.data.get("delay_min", WS_DEFAULT_DELAY_MIN)))
+                    d_max = max(d_min, float(self.data.get("delay_max", WS_DEFAULT_DELAY_MAX)))
+                    interval = random.uniform(d_min, d_max)
 
-                next_fire = max(next_fire + interval, time.monotonic())
+                    with self._pool_resize_lock:
+                        live = sum(1 for s in self.sockets if s is not None)
+                    max_inflight = max(4, live * 4) if live > 0 else 2
+
+                    now = time.monotonic()
+                    max_debt = max(0.3, interval * 2)
+                    if next_fire < now - max_debt:
+                        next_fire = now
+
+                    wait = next_fire - now
+                    if wait > 0 and self.stop_event.wait(wait):
+                        break
+
+                    with self._inflight_lock:
+                        if self._inflight >= max_inflight:
+                            next_fire = time.monotonic() + min(interval, 0.1)
+                            continue
+                        self._inflight += 1
+
+                    try:
+                        self._executor.submit(self._fire_message_rr)
+                    except RuntimeError:
+                        with self._inflight_lock:
+                            self._inflight -= 1
+                        break
+
+                    next_fire = max(next_fire + interval, time.monotonic())
+                except BaseException as exc:
+                    record_log("ERROR", "WS_MSGLOOP", f"Tick error: {exc}", persist=True)
+                    self.stop_event.wait(0.5)
         finally:
             try:
                 self._executor.shutdown(wait=False, cancel_futures=True)
@@ -994,6 +1085,7 @@ class WsSessionWorker:
 
             msg = self.build_message()
             dispatched = False
+            now_mono = time.monotonic()
 
             for offset in range(n):
                 if self.stop_event.is_set():
@@ -1010,6 +1102,8 @@ class WsSessionWorker:
                             sock = self.sockets[i] if i < len(self.sockets) else None
                         if sock is None:
                             continue
+                        if i < len(self._sock_backoff_until) and now_mono < self._sock_backoff_until[i]:
+                            continue
                         res = sock.send_message(int(tid_str), {"text": msg})
 
                     dispatched = True
@@ -1017,6 +1111,8 @@ class WsSessionWorker:
                         with lock_i:
                             if i < len(self._streak_false):
                                 self._streak_false[i] = 0
+                            if i < len(self._sock_backoff_until):
+                                self._sock_backoff_until[i] = 0.0
                         with self._stats_lock:
                             self.stats["sent"] += 1
                         with tasks_lock:
@@ -1030,20 +1126,34 @@ class WsSessionWorker:
                             if is_false:
                                 self._streak_false[i] += 1
                             streak = self._streak_false[i]
+                        if i < len(self._sock_backoff_until) and is_false:
+                            self._sock_backoff_until[i] = time.monotonic() + min(3.0, 0.35 * max(1, streak))
                     with self._stats_lock:
                         self.stats["failed"] += 1
                         self.stats["last_error"] = str(res)[:100]
+                    if is_false and streak in (1, 3, 5):
+                        record_log(
+                            "WARN",
+                            f"WS_REPLY_FALSE:{self.data.get('session_name', '?')}",
+                            f"sock@{i} streak={streak}: {str(res)[:120]}",
+                            persist=(streak >= 5),
+                        )
                     if streak >= 5:
                         self._evict_socket(i)
-                except Exception as exc:
+                    return
+                except BaseException as exc:
                     with self._stats_lock:
                         self.stats["failed"] += 1
                         self.stats["last_error"] = f"sock@{i}: {str(exc)[:80]}"
+                    record_log("WARN", f"WS_SEND_ERR:{i}", f"{type(exc).__name__}: {str(exc)[:120]}")
+                    self._evict_socket(i)
 
             if not dispatched:
                 with self._stats_lock:
                     self.stats["failed"] += 1
-                    self.stats["last_error"] = "All pool sockets disconnected"
+                    self.stats["last_error"] = "All pool sockets disconnected or cooling down"
+        except BaseException as exc:
+            record_log("ERROR", "WS_FIRE_FATAL", f"{type(exc).__name__}: {str(exc)[:160]}", persist=True)
         finally:
             with self._inflight_lock:
                 if self._inflight > 0:
@@ -1062,7 +1172,7 @@ class WsSessionWorker:
                     with locks[i]:
                         sock.update_thread_title(tid_int, new_title)
                     return True
-            except Exception:
+            except BaseException:
                 continue
 
         uname = str(self.data.get("session_name") or "").strip().lstrip("@")
@@ -1071,45 +1181,45 @@ class WsSessionWorker:
                 cl = get_or_resume_client(uname)
                 cl.direct_thread_update_title(tid_int, new_title)
                 return True
-            except Exception:
+            except BaseException:
                 pass
         return False
 
     def _rename_loop(self):
-        """
-        Paced group name updater: no instant all-threads burst on start;
-        waits the interval first, then updates threads one by one with a gap between each.
-        """
         while not self.stop_event.is_set():
-            interval = random.uniform(WS_RENAME_MIN_SEC, WS_RENAME_MAX_SEC)
-            if self.stop_event.wait(interval):
-                break
-
-            if not bool(self.data.get("use_nc", True)):
-                continue
-
-            tids = self._get_target_threads()
-            if not tids:
-                continue
-
-            title_tpl = str(self.data.get("gc_name_text") or "").strip() or get_active_group_title_template()
-            target_name = str(self.data.get("target_name") or "").strip()
-            new_title = title_tpl.replace("{TARGET}", target_name).strip()[:75]
-            if not new_title:
-                continue
-
-            for idx, tid_str in enumerate(tids):
-                if self.stop_event.is_set() or not bool(self.data.get("use_nc", True)):
+            try:
+                interval = random.uniform(WS_RENAME_MIN_SEC, WS_RENAME_MAX_SEC)
+                if self.stop_event.wait(interval):
                     break
-                ok = self._rename_single_thread(tid_str, new_title)
-                with self._stats_lock:
-                    if ok:
-                        self.stats["renames"] += 1
-                    else:
-                        self.stats["last_error"] = f"NC skip/err {tid_str}"
-                if idx < len(tids) - 1:
-                    if self.stop_event.wait(WS_RENAME_PER_THREAD_GAP_SEC):
+
+                if not bool(self.data.get("use_nc", True)):
+                    continue
+
+                tids = self._get_target_threads()
+                if not tids:
+                    continue
+
+                title_tpl = str(self.data.get("gc_name_text") or "").strip() or get_active_group_title_template()
+                target_name = str(self.data.get("target_name") or "").strip()
+                new_title = title_tpl.replace("{TARGET}", target_name).strip()[:75]
+                if not new_title:
+                    continue
+
+                for idx, tid_str in enumerate(tids):
+                    if self.stop_event.is_set() or not bool(self.data.get("use_nc", True)):
                         break
+                    ok = self._rename_single_thread(tid_str, new_title)
+                    with self._stats_lock:
+                        if ok:
+                            self.stats["renames"] += 1
+                        else:
+                            self.stats["last_error"] = f"NC skip/err {tid_str}"
+                    if idx < len(tids) - 1:
+                        if self.stop_event.wait(WS_RENAME_PER_THREAD_GAP_SEC):
+                            break
+            except BaseException as exc:
+                record_log("WARN", "WS_RENAME", f"Loop error: {exc}")
+                self.stop_event.wait(5.0)
 
     def snapshot(self, uid: str) -> dict:
         with self._stats_lock:
@@ -1171,7 +1281,7 @@ def log_creator(job_id: str, msg: str, created_id: Optional[str] = None, err: Op
             job["created_count"] = len(job["created_ids"])
         if err:
             job["errors"].append(err)
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] GC_JOB {job_id}: {msg}", flush=True)
+    record_log("INFO", f"GC_JOB:{job_id}", msg)
 
 
 def group_creator_loop(job_id: str):
@@ -1278,7 +1388,7 @@ def log_task(task_id: str, msg: str):
             return
         task["last_event"] = msg
         task["last_update"] = datetime.now().strftime("%H:%M:%S")
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {task_id}: {msg}", flush=True)
+    record_log("INFO", f"TASK:{task_id}", msg)
 
 
 def generate_slow_band():
@@ -1315,7 +1425,6 @@ def apply_group_names_once(task_id: str, cl: Client, thread_ids: list[str], targ
 
 
 def group_rename_loop(task_id: str, cl: Client, thread_ids: list[str], target_name: str):
-    """Changes group name one by one every 10-20 minutes (600-1200s)."""
     while is_task_running(task_id):
         interval = random.uniform(600, 1200)
         slept = 0.0
@@ -1491,6 +1600,34 @@ class WsSocketCountReq(BaseModel):
 
 # ======================== API ROUTES ========================
 
+@app.get("/api/logs")
+def api_logs(x_panel_token: Optional[str] = Header(default=None), token: Optional[str] = None):
+    verify_auth(x_panel_token, token)
+    with log_lock:
+        live = list(LIVE_LOGS)
+    crash_tail = []
+    if os.path.exists(CRASH_LOG_FILE):
+        try:
+            with open(CRASH_LOG_FILE, "r", encoding="utf-8") as f:
+                crash_tail = [ln.rstrip("\n") for ln in f.readlines()[-60:]]
+        except Exception:
+            crash_tail = []
+    return {"live_logs": live, "crash_logs": crash_tail}
+
+
+@app.post("/api/logs/clear")
+def api_clear_logs(x_panel_token: Optional[str] = Header(default=None), token: Optional[str] = None):
+    verify_auth(x_panel_token, token)
+    with log_lock:
+        LIVE_LOGS.clear()
+    if os.path.exists(CRASH_LOG_FILE):
+        try:
+            os.remove(CRASH_LOG_FILE)
+        except Exception:
+            pass
+    return {"ok": True}
+
+
 @app.get("/api/state")
 def api_state(x_panel_token: Optional[str] = Header(default=None), token: Optional[str] = None):
     verify_auth(x_panel_token, token)
@@ -1533,6 +1670,9 @@ def api_state(x_panel_token: Optional[str] = Header(default=None), token: Option
     with ws_lock:
         ws_view = [w.snapshot(uid) for uid, w in ws_sessions.items()]
 
+    with log_lock:
+        recent_logs = list(LIVE_LOGS)[-40:]
+
     return {
         "accounts": load_saved_accounts(),
         "template": get_active_single_line_template(),
@@ -1541,6 +1681,7 @@ def api_state(x_panel_token: Optional[str] = Header(default=None), token: Option
         "tasks": tasks_view,
         "group_creator_jobs": creator_view,
         "ws_sessions": ws_view,
+        "recent_logs": recent_logs,
         "igrapiweb_available": IGRAPIWEB_AVAILABLE,
         "global_messages_sent": GLOBAL_MESSAGES_SENT,
         "uptime": str(datetime.now() - BOT_START_TIME).split(".")[0],
@@ -2119,6 +2260,21 @@ HTML_PAGE = """<!DOCTYPE html>
     .ws-item { border-top: 1px solid var(--border); padding: 12px 0; display: flex; flex-direction: column; gap: 8px; }
     .ws-item:first-child { border-top: 0; }
     .ws-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+    .log-console {
+      background: #090b10;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      max-height: 230px;
+      overflow-y: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.78rem;
+      line-height: 1.45;
+      color: #cbd5e1;
+      white-space: pre-wrap;
+      word-break: break-word;
+      margin-top: 8px;
+    }
     details { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 10px; }
     summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; }
     .toast { position: fixed; bottom: 18px; right: 18px; background: #1f2937; border: 1px solid var(--border); padding: 10px 14px; border-radius: 8px; display: none; z-index: 50; max-width: 420px; }
@@ -2357,6 +2513,18 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
       </div>
     </div>
+
+    <div class="card">
+      <div class="top" style="margin-bottom:4px;">
+        <h2 style="margin:0;">8. Live Panel & Crash Logs</h2>
+        <div class="row" style="margin:0;">
+          <button class="secondary" onclick="fetchFullLogs()">Load Crash History</button>
+          <button class="secondary" onclick="clearLogs()">Clear Logs</button>
+        </div>
+      </div>
+      <div class="muted">Shows recent WebSocket events, <code>reply: False</code> warnings, and saved crash tracebacks directly in the browser.</div>
+      <div id="liveLogConsole" class="log-console">Waiting for logs...</div>
+    </div>
   </div>
 
   <div class="toast" id="toast"></div>
@@ -2472,6 +2640,31 @@ HTML_PAGE = """<!DOCTYPE html>
       renderThreadPicker();
     }
 
+    async function fetchFullLogs() {
+      try {
+        const { data } = await api("/api/logs");
+        const box = document.getElementById("liveLogConsole");
+        const parts = [];
+        if (data.crash_logs && data.crash_logs.length) {
+          parts.push("=== SAVED CRASH / WARNING LOGS ===");
+          parts.push(...data.crash_logs);
+          parts.push("");
+        }
+        parts.push("=== LIVE MEMORY LOGS ===");
+        parts.push(...(data.live_logs || []));
+        box.textContent = parts.join("\n") || "No logs recorded yet.";
+        box.scrollTop = box.scrollHeight;
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function clearLogs() {
+      try {
+        await api("/api/logs/clear", "POST");
+        document.getElementById("liveLogConsole").textContent = "Logs cleared.";
+        showToast("Logs cleared");
+      } catch (e) { showToast(e.message, true); }
+    }
+
     async function refreshState() {
       try {
         const { data } = await api("/api/state");
@@ -2484,6 +2677,13 @@ HTML_PAGE = """<!DOCTYPE html>
           wsAvail.textContent = data.igrapiweb_available
             ? "igrapiweb loaded · Fast multi-socket dispatcher (0.2–0.8s default), rotation & health checks, live socket count scaling, and one-by-one NC."
             : "igrapiweb not detected in current Python environment (install igrapiweb to connect WS sockets).";
+        }
+
+        if (data.recent_logs && data.recent_logs.length) {
+          const box = document.getElementById("liveLogConsole");
+          const wasAtBottom = (box.scrollHeight - box.scrollTop - box.clientHeight) < 40;
+          box.textContent = data.recent_logs.join("\n");
+          if (wasAtBottom) box.scrollTop = box.scrollHeight;
         }
 
         const accs = Object.keys(data.accounts || {});
@@ -2878,5 +3078,5 @@ def index(request: Request):
 
 
 if __name__ == "__main__":
-    print(f"🌐 Web panel listening on 0.0.0.0:{PORT} (DATA_DIR={DATA_DIR})", flush=True)
+    record_log("INFO", "BOOT", f"Web panel listening on 0.0.0.0:{PORT} (DATA_DIR={DATA_DIR})")
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
