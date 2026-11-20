@@ -76,6 +76,10 @@ WS_UA_POOL = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
 ]
 
+WS_ROTATE_MIN = float(os.environ.get("WS_ROTATE_MIN", "1800"))
+WS_ROTATE_MAX = float(os.environ.get("WS_ROTATE_MAX", "5400"))
+WS_HEALTH_CHECK_MIN = float(os.environ.get("WS_HEALTH_CHECK_MIN", "300"))
+WS_HEALTH_CHECK_MAX = float(os.environ.get("WS_HEALTH_CHECK_MAX", "600"))
 WS_MIN_SAFE_MSG_DELAY = float(os.environ.get("WS_MIN_SAFE_MSG_DELAY", "0.2"))
 WS_DEFAULT_DELAY_MIN = float(os.environ.get("WS_DEFAULT_DELAY_MIN", "0.2"))
 WS_DEFAULT_DELAY_MAX = float(os.environ.get("WS_DEFAULT_DELAY_MAX", "0.8"))
@@ -83,6 +87,7 @@ WS_POOL_WATCHDOG_SEC = float(os.environ.get("WS_POOL_WATCHDOG_SEC", "3.0"))
 WS_RENAME_MIN_SEC = float(os.environ.get("WS_RENAME_MIN_SEC", "600.0"))
 WS_RENAME_MAX_SEC = float(os.environ.get("WS_RENAME_MAX_SEC", "1200.0"))
 WS_RENAME_PER_THREAD_GAP_SEC = float(os.environ.get("WS_RENAME_PER_THREAD_GAP_SEC", "4.0"))
+MIN_SAFE_ADD_COOLDOWN = 20.0
 
 try:
     WS_SOCKET_POOL = max(1, min(10, int(os.environ.get("SOCKET_POOL", "3"))))
@@ -536,6 +541,8 @@ class WsSessionWorker:
         self.stop_event = threading.Event()
         self.msg_thread = None
         self.rename_thread = None
+        self.rotate_thread = None
+        self.health_thread = None
         self.watchdog_thread = None
         self.listen_threads = []
         self._executor = None
@@ -547,7 +554,6 @@ class WsSessionWorker:
         self.sockets = []
         self.socket_locks = []
         self._streak_false = []
-        self._cooldown_until = []
         self._pool_resize_lock = threading.Lock()
 
         self._rr_sock_idx = 0
@@ -558,8 +564,6 @@ class WsSessionWorker:
 
         self._inflight = 0
         self._inflight_lock = threading.Lock()
-        self._throttle_penalty = 0.0
-        self._throttle_lock = threading.Lock()
 
         if not self.data.get("ua"):
             self.data["ua"] = random.choice(WS_UA_POOL)
@@ -573,6 +577,7 @@ class WsSessionWorker:
             "sent": 0,
             "failed": 0,
             "renames": 0,
+            "rotations": 0,
             "start_time": None,
             "status": "stopped",
             "last_error": None,
@@ -611,7 +616,7 @@ class WsSessionWorker:
             base["device_dict"] = self._device_id
         return base
 
-    def _connect(self, label: str, max_retries: int = 2, retry_delay: float = 1.0):
+    def _connect(self, label: str, max_retries: int = 2, retry_delay: float = 0.75):
         if not IGRAPIWEB_AVAILABLE or make_ig_web_socket is None:
             raise RuntimeError("igrapiweb is not installed in this environment.")
         err = None
@@ -634,10 +639,10 @@ class WsSessionWorker:
                 except Exception as exc:
                     err = exc
                     if "connack" in str(exc).lower():
-                        time.sleep(min(0.6, retry_delay))
+                        time.sleep(min(0.4, retry_delay))
                         continue
             if attempt < max_retries - 1:
-                time.sleep(min(0.8, retry_delay))
+                time.sleep(min(0.6, retry_delay))
         raise RuntimeError(f"{label}: {err}")
 
     def _listen_loop(self, sock):
@@ -650,16 +655,15 @@ class WsSessionWorker:
         self.sockets = [None] * n
         self.socket_locks = [threading.Lock() for _ in range(n)]
         self._streak_false = [0] * n
-        self._cooldown_until = [0.0] * n
         self.pool_size = n
 
     def _connect_slot_worker(self, idx: int, label: str):
         if self.stop_event.is_set():
             return None
         if idx > 0:
-            time.sleep(0.25 * idx)
+            time.sleep(0.15 * idx)
         try:
-            return self._connect(label, max_retries=2, retry_delay=0.75)
+            return self._connect(label, max_retries=2, retry_delay=0.6)
         except Exception as exc:
             with self._stats_lock:
                 self.stats["last_error"] = f"{label}: {str(exc)[:80]}"
@@ -700,7 +704,6 @@ class WsSessionWorker:
                 self.sockets = self.sockets[:target]
                 self.socket_locks = self.socket_locks[:target]
                 self._streak_false = self._streak_false[:target]
-                self._cooldown_until = self._cooldown_until[:target]
                 self.pool_size = target
                 for s in removed:
                     if s is not None:
@@ -712,7 +715,6 @@ class WsSessionWorker:
                 extra = target - current
                 self.socket_locks.extend(threading.Lock() for _ in range(extra))
                 self._streak_false.extend([0] * extra)
-                self._cooldown_until.extend([0.0] * extra)
                 self.sockets.extend([None] * extra)
                 self.pool_size = target
                 if not self.stop_event.is_set():
@@ -729,7 +731,7 @@ class WsSessionWorker:
             if self.stop_event.is_set() or i >= len(self.sockets):
                 break
             try:
-                sock = self._connect(f"grow{i}", max_retries=2, retry_delay=0.75)
+                sock = self._connect(f"grow{i}", max_retries=2, retry_delay=0.6)
                 with self._pool_resize_lock:
                     if i < len(self.sockets) and self.sockets[i] is None:
                         self.sockets[i] = sock
@@ -751,6 +753,8 @@ class WsSessionWorker:
         for old_t in (
             self.msg_thread,
             self.rename_thread,
+            self.rotate_thread,
+            self.health_thread,
             self.watchdog_thread,
         ):
             if old_t and old_t.is_alive():
@@ -769,8 +773,6 @@ class WsSessionWorker:
         self.listen_threads = []
         self._rr_sock_idx = 0
         self._rr_thread_idx = 0
-        with self._throttle_lock:
-            self._throttle_penalty = 0.0
 
         try:
             ok = self._seed_pool()
@@ -787,6 +789,7 @@ class WsSessionWorker:
                 "sent": 0,
                 "failed": 0,
                 "renames": 0,
+                "rotations": 0,
                 "last_error": None if ok == self.pool_size else f"only {ok}/{self.pool_size} sockets",
                 "session_status": None,
                 "session_error": None,
@@ -794,8 +797,12 @@ class WsSessionWorker:
 
         self.msg_thread = threading.Thread(target=self._msg_loop, daemon=True)
         self.watchdog_thread = threading.Thread(target=self._pool_watchdog_loop, daemon=True)
+        self.rotate_thread = threading.Thread(target=self._ws_rotate_loop, daemon=True)
+        self.health_thread = threading.Thread(target=self._health_check_loop, daemon=True)
         self.msg_thread.start()
         self.watchdog_thread.start()
+        self.rotate_thread.start()
+        self.health_thread.start()
 
         if bool(self.data.get("use_nc", True)):
             self.rename_thread = threading.Thread(target=self._rename_loop, daemon=True)
@@ -826,13 +833,42 @@ class WsSessionWorker:
                 self.sockets[idx] = None
                 if idx < len(self._streak_false):
                     self._streak_false[idx] = 0
-                if idx < len(self._cooldown_until):
-                    self._cooldown_until[idx] = 0.0
         if old:
             try:
                 old.disconnect()
             except Exception:
                 pass
+
+    def _ws_rotate_loop(self):
+        while not self.stop_event.is_set():
+            interval = random.uniform(max(60.0, WS_ROTATE_MIN), max(120.0, WS_ROTATE_MAX))
+            if self.stop_event.wait(interval):
+                break
+            with self._pool_resize_lock:
+                n = len(self.sockets)
+            for i in range(n):
+                if self.stop_event.is_set():
+                    break
+                self._evict_socket(i)
+                with self._stats_lock:
+                    self.stats["rotations"] += 1
+                self.stop_event.wait(0.3)
+
+    def _health_check_loop(self):
+        while not self.stop_event.is_set():
+            interval = random.uniform(max(30.0, WS_HEALTH_CHECK_MIN), max(60.0, WS_HEALTH_CHECK_MAX))
+            if self.stop_event.wait(interval):
+                break
+            with self._pool_resize_lock:
+                n = len(self.sockets)
+            for i in range(n):
+                if self.stop_event.is_set() or i >= len(self.sockets):
+                    break
+                with self.socket_locks[i]:
+                    sock = self.sockets[i]
+                    streak = self._streak_false[i] if i < len(self._streak_false) else 0
+                if sock is None or streak >= 3:
+                    self._evict_socket(i)
 
     def _pool_watchdog_loop(self):
         while not self.stop_event.is_set():
@@ -851,7 +887,7 @@ class WsSessionWorker:
                         needs_connect = self.sockets[i] is None
                 if needs_connect:
                     try:
-                        new_sock = self._connect(f"wd{i}", max_retries=2, retry_delay=0.75)
+                        new_sock = self._connect(f"wd{i}", max_retries=2, retry_delay=0.6)
                         with self._pool_resize_lock:
                             if i < len(self.sockets):
                                 with self.socket_locks[i]:
@@ -876,37 +912,22 @@ class WsSessionWorker:
             self._rr_thread_idx = (self._rr_thread_idx + 1) % len(tids)
         return tid
 
-    def _count_healthy_sockets(self, now_mono: float) -> tuple[int, int]:
-        with self._pool_resize_lock:
-            n = len(self.sockets)
-            live = 0
-            healthy = 0
-            for i in range(n):
-                with self.socket_locks[i]:
-                    if self.sockets[i] is not None:
-                        live += 1
-                        cd = self._cooldown_until[i] if i < len(self._cooldown_until) else 0.0
-                        if now_mono >= cd:
-                            healthy += 1
-        return live, healthy
-
     def _msg_loop(self):
-        self._executor = ThreadPoolExecutor(max_workers=12)
+        self._executor = ThreadPoolExecutor(max_workers=16)
         next_fire = time.monotonic()
 
         try:
             while not self.stop_event.is_set():
                 d_min = max(WS_MIN_SAFE_MSG_DELAY, float(self.data.get("delay_min", WS_DEFAULT_DELAY_MIN)))
                 d_max = max(d_min, float(self.data.get("delay_max", WS_DEFAULT_DELAY_MAX)))
-                with self._throttle_lock:
-                    penalty = self._throttle_penalty
-                interval = random.uniform(d_min, d_max) + penalty
+                interval = random.uniform(d_min, d_max)
+
+                with self._pool_resize_lock:
+                    live = sum(1 for s in self.sockets if s is not None)
+                max_inflight = max(4, live * 4) if live > 0 else 2
 
                 now = time.monotonic()
-                live, healthy = self._count_healthy_sockets(now)
-                max_inflight = max(1, healthy if healthy > 0 else live)
-
-                max_debt = max(0.4, interval * 2)
+                max_debt = max(0.3, interval * 2)
                 if next_fire < now - max_debt:
                     next_fire = now
 
@@ -916,7 +937,7 @@ class WsSessionWorker:
 
                 with self._inflight_lock:
                     if self._inflight >= max_inflight:
-                        next_fire = time.monotonic() + min(interval, 0.25)
+                        next_fire = time.monotonic() + min(interval, 0.1)
                         continue
                     self._inflight += 1
 
@@ -947,102 +968,82 @@ class WsSessionWorker:
                     return True
         return False
 
-    def _record_success(self):
-        global GLOBAL_MESSAGES_SENT
-        with self._stats_lock:
-            self.stats["sent"] += 1
-        with tasks_lock:
-            GLOBAL_MESSAGES_SENT += 1
-        with self._throttle_lock:
-            self._throttle_penalty = max(0.0, self._throttle_penalty * 0.7 - 0.02)
-
-    def _record_failure(self, detail: str, is_false_reply: bool):
-        with self._stats_lock:
-            self.stats["failed"] += 1
-            self.stats["last_error"] = detail[:100]
-        with self._throttle_lock:
-            bump = 0.25 if is_false_reply else 0.12
-            self._throttle_penalty = min(1.5, self._throttle_penalty + bump)
-
     def _fire_message_rr(self):
+        global GLOBAL_MESSAGES_SENT
         try:
             if self.stop_event.is_set():
                 return
 
             tid_str = self._pick_thread_id()
             if not tid_str or not tid_str.isdigit():
-                self._record_failure("No valid thread ID configured", False)
+                with self._stats_lock:
+                    self.stats["failed"] += 1
+                    self.stats["last_error"] = "No valid thread ID configured"
                 return
-
-            msg = self.build_message()
-            now_mono = time.monotonic()
 
             with self._pool_resize_lock:
                 n = len(self.sockets)
                 if n == 0:
-                    self._record_failure("No active sockets in pool", False)
+                    with self._stats_lock:
+                        self.stats["failed"] += 1
+                        self.stats["last_error"] = "No active sockets in pool"
                     return
                 with self._rr_sock_lock:
-                    start_idx = self._rr_sock_idx % n
+                    idx = self._rr_sock_idx % n
                     self._rr_sock_idx = (self._rr_sock_idx + 1) % n
 
-            # First pass: prefer sockets that are connected and not on cooldown
-            candidates = []
-            fallback_candidates = []
-            with self._pool_resize_lock:
-                curr_n = len(self.sockets)
-                for offset in range(curr_n):
-                    i = (start_idx + offset) % curr_n
-                    with self.socket_locks[i]:
-                        sock = self.sockets[i]
-                        cd = self._cooldown_until[i] if i < len(self._cooldown_until) else 0.0
-                    if sock is not None:
-                        if now_mono >= cd:
-                            candidates.append((i, sock))
-                        else:
-                            fallback_candidates.append((i, sock))
+            msg = self.build_message()
+            dispatched = False
 
-            ordered = candidates if candidates else fallback_candidates
-            if not ordered:
-                self._record_failure("All pool sockets disconnected", False)
-                return
-
-            for i, sock in ordered:
+            for offset in range(n):
                 if self.stop_event.is_set():
                     return
+                i = (idx + offset) % n
+                with self._pool_resize_lock:
+                    if i >= len(self.sockets):
+                        continue
+                    lock_i = self.socket_locks[i]
+
                 try:
-                    with self.socket_locks[i]:
-                        if i >= len(self.sockets) or self.sockets[i] is not sock:
+                    with lock_i:
+                        with self._pool_resize_lock:
+                            sock = self.sockets[i] if i < len(self.sockets) else None
+                        if sock is None:
                             continue
                         res = sock.send_message(int(tid_str), {"text": msg})
 
+                    dispatched = True
                     if self._is_ok(res):
-                        with self.socket_locks[i]:
+                        with lock_i:
                             if i < len(self._streak_false):
                                 self._streak_false[i] = 0
-                            if i < len(self._cooldown_until):
-                                self._cooldown_until[i] = 0.0
-                        self._record_success()
+                        with self._stats_lock:
+                            self.stats["sent"] += 1
+                        with tasks_lock:
+                            GLOBAL_MESSAGES_SENT += 1
                         return
 
-                    is_false = isinstance(res, dict) and res.get("reply") is False
                     streak = 0
-                    with self.socket_locks[i]:
+                    is_false = isinstance(res, dict) and res.get("reply") is False
+                    with lock_i:
                         if i < len(self._streak_false):
-                            self._streak_false[i] += 1 if is_false else 0
+                            if is_false:
+                                self._streak_false[i] += 1
                             streak = self._streak_false[i]
-                        if i < len(self._cooldown_until):
-                            cd_sec = min(4.0, 0.35 * max(1, streak)) if is_false else 0.25
-                            self._cooldown_until[i] = time.monotonic() + cd_sec
-
-                    self._record_failure(str(res), is_false)
+                    with self._stats_lock:
+                        self.stats["failed"] += 1
+                        self.stats["last_error"] = str(res)[:100]
                     if streak >= 5:
                         self._evict_socket(i)
                 except Exception as exc:
-                    with self.socket_locks[i]:
-                        if i < len(self._cooldown_until):
-                            self._cooldown_until[i] = time.monotonic() + 0.5
-                    self._record_failure(f"sock@{i}: {exc}", False)
+                    with self._stats_lock:
+                        self.stats["failed"] += 1
+                        self.stats["last_error"] = f"sock@{i}: {str(exc)[:80]}"
+
+            if not dispatched:
+                with self._stats_lock:
+                    self.stats["failed"] += 1
+                    self.stats["last_error"] = "All pool sockets disconnected"
         finally:
             with self._inflight_lock:
                 if self._inflight > 0:
@@ -1050,7 +1051,6 @@ class WsSessionWorker:
 
     def _rename_single_thread(self, tid_str: str, new_title: str) -> bool:
         tid_int = int(tid_str)
-        # Prefer active WS socket if available
         with self._pool_resize_lock:
             socks = list(self.sockets)
             locks = list(self.socket_locks)
@@ -1065,7 +1065,6 @@ class WsSessionWorker:
             except Exception:
                 continue
 
-        # Fallback to saved instagrapi session if available
         uname = str(self.data.get("session_name") or "").strip().lstrip("@")
         if uname:
             try:
@@ -2281,7 +2280,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
     <div class="card">
       <h2>5. WebSocket Multi-Sender (igrapiweb)</h2>
-      <div class="muted" id="wsAvailBar">Fast multi-socket dispatcher with per-socket cooldowns, live socket scaling, and one-by-one NC (no instant burst).</div>
+      <div class="muted" id="wsAvailBar">Fast multi-socket dispatcher with configurable min/max delay, rotation & health checks, live socket scaling, and one-by-one NC.</div>
 
       <div class="two-col-inline">
         <div>
@@ -2483,7 +2482,7 @@ HTML_PAGE = """<!DOCTYPE html>
         const wsAvail = document.getElementById("wsAvailBar");
         if (wsAvail) {
           wsAvail.textContent = data.igrapiweb_available
-            ? "igrapiweb loaded · Fast multi-socket dispatcher (0.2–0.8s default), per-socket cooldowns, live socket count scaling, and one-by-one NC."
+            ? "igrapiweb loaded · Fast multi-socket dispatcher (0.2–0.8s default), rotation & health checks, live socket count scaling, and one-by-one NC."
             : "igrapiweb not detected in current Python environment (install igrapiweb to connect WS sockets).";
         }
 
@@ -2533,13 +2532,17 @@ HTML_PAGE = """<!DOCTYPE html>
                 </div>
               </div>
               <div class="muted">
-                Sent: <strong>${st.sent || 0}</strong> · Failed: <strong>${st.failed || 0}</strong> · Renames: <strong>${st.renames || 0}</strong> · Delay: ${w.delay_min}–${w.delay_max}s${errTxt}
+                Sent: <strong>${st.sent || 0}</strong> · Failed: <strong>${st.failed || 0}</strong> · Renames: <strong>${st.renames || 0}</strong> · Rotations: <strong>${st.rotations || 0}</strong> · Delay: ${w.delay_min}–${w.delay_max}s${errTxt}
               </div>
               <div class="tid-mono">Threads: ${escapeHtml((w.thread_ids || []).join(", "))}</div>
               <div class="row" style="margin-top:4px;">
                 <span class="muted">Live Sockets (1–10):</span>
                 <input id="wsSockInput_${escapeHtml(w.uid)}" type="number" min="1" max="10" value="${w.socket_pool}" style="width:76px; padding:5px 8px;" />
                 <button class="secondary" onclick="wsApplySockets('${escapeHtml(w.uid)}')">Apply Sockets</button>
+                <span class="muted">Delay Min/Max:</span>
+                <input id="wsDMin_${escapeHtml(w.uid)}" type="number" step="0.05" min="0.2" value="${w.delay_min}" style="width:74px; padding:5px 8px;" />
+                <input id="wsDMax_${escapeHtml(w.uid)}" type="number" step="0.05" min="0.2" value="${w.delay_max}" style="width:74px; padding:5px 8px;" />
+                <button class="secondary" onclick="wsApplyDelay('${escapeHtml(w.uid)}')">Apply Delay</button>
               </div>
             </div>`;
           }).join("");
@@ -2663,6 +2666,19 @@ HTML_PAGE = """<!DOCTYPE html>
         const socket_pool = parseInt(el ? el.value : "3", 10) || 3;
         const { data } = await api(`/api/ws/${encodeURIComponent(uid)}/sockets`, "POST", { socket_pool });
         showToast(`${uid} socket count set to ${data.socket_pool}`);
+        refreshState();
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function wsApplyDelay(uid) {
+      try {
+        const dMinEl = document.getElementById(`wsDMin_${uid}`);
+        const dMaxEl = document.getElementById(`wsDMax_${uid}`);
+        const delay_min = parseFloat(dMinEl ? dMinEl.value : "0.2");
+        const delay_max = parseFloat(dMaxEl ? dMaxEl.value : "0.8");
+        const { data } = await api(`/api/ws/${encodeURIComponent(uid)}/update`, "POST", { delay_min, delay_max });
+        const s = data.session || {};
+        showToast(`${uid} delay set to ${s.delay_min}–${s.delay_max}s`);
         refreshState();
       } catch (e) { showToast(e.message, true); }
     }
