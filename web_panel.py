@@ -900,4 +900,987 @@ def api_login_password(
 
     cl = None
     try:
-        if body.two_factor_code
+        if body.two_factor_code and uname in pending_2fa:
+            cl = pending_2fa[uname]["client"]
+            cl.login(uname, body.password, verification_code=body.two_factor_code.strip())
+            pending_2fa.pop(uname, None)
+            save_session(cl, uname, "password+2fa")
+            return {"ok": True, "username": uname, "user_id": str(cl.user_id)}
+
+        cl = make_ig_client()
+        cl.login(uname, body.password)
+        save_session(cl, uname, "password")
+        return {"ok": True, "username": uname, "user_id": str(cl.user_id)}
+    except TwoFactorRequired:
+        if cl is not None:
+            pending_2fa[uname] = {"client": cl, "password": body.password}
+        return JSONResponse(
+            status_code=202,
+            content={"two_factor_required": True, "username": uname, "detail": "Enter 6-digit 2FA code."},
+        )
+    except BadPassword:
+        raise HTTPException(status_code=401, detail="Incorrect Instagram password.")
+    except ClientNeedsUpgradeError:
+        raise HTTPException(
+            status_code=400,
+            detail="Instagram rejected app version (ClientNeedsUpgradeError). Upgrade instagrapi, set IG_APP_VERSION / IG_VERSION_CODE, or use Session ID fallback.",
+        )
+    except Exception as exc:
+        msg = str(exc)
+        if "out of date" in msg.lower() or "upgrade your app" in msg.lower():
+            msg = f"{msg} — Upgrade instagrapi or set IG_APP_VERSION / IG_VERSION_CODE, or use Session ID fallback."
+        raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {msg[:200]}")
+
+
+@app.delete("/api/accounts/{username}")
+def api_delete_account(
+    username: str,
+    x_panel_token: Optional[str] = Header(default=None),
+    token: Optional[str] = None,
+):
+    verify_auth(x_panel_token, token)
+    delete_saved_account(username)
+    return {"ok": True, "removed": username}
+
+
+@app.get("/api/threads/{username}")
+def api_threads(
+    username: str,
+    x_panel_token: Optional[str] = Header(default=None),
+    token: Optional[str] = None,
+):
+    verify_auth(x_panel_token, token)
+    try:
+        cl = get_or_resume_client(username)
+        return {"ok": True, "threads": list_threads(cl)}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {str(exc)[:180]}")
+
+
+@app.post("/api/groups/create")
+def api_create_groups(
+    body: CreateGroupsReq,
+    x_panel_token: Optional[str] = Header(default=None),
+    token: Optional[str] = None,
+):
+    verify_auth(x_panel_token, token)
+    uname = body.username.strip().lstrip("@")
+    count = int(body.count or 1)
+    unames = parse_usernames(body.usernames)
+    if not uname:
+        raise HTTPException(status_code=400, detail="Account username is required.")
+    if count < 1 or count > 50:
+        raise HTTPException(status_code=400, detail="Group count must be between 1 and 50.")
+    if len(unames) < 2:
+        raise HTTPException(status_code=400, detail="Enter at least 2 usernames (comma-separated) to create a group.")
+
+    min_cd = max(10.0, float(body.min_cooldown if body.min_cooldown is not None else 25.0))
+    max_cd = max(min_cd, float(body.max_cooldown if body.max_cooldown is not None else 45.0))
+    title_tpl = (body.title_template or "").strip() or get_active_group_title_template()
+    target_name = (body.target_name or "").strip()
+    send_ping = bool(True if body.send_ping is None else body.send_ping)
+
+    try:
+        cl = get_or_resume_client(uname)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    job_id = f"G{uuid.uuid4().hex[:6].upper()}"
+    with tasks_lock:
+        group_creator_jobs[job_id] = {
+            "job_id": job_id,
+            "client": cl,
+            "username": uname,
+            "count": count,
+            "title_template": title_tpl,
+            "target_name": target_name,
+            "usernames": unames,
+            "send_ping": send_ping,
+            "min_cooldown": min_cd,
+            "max_cooldown": max_cd,
+            "running": True,
+            "created_count": 0,
+            "created_ids": [],
+            "errors": [],
+            "last_event": f"Queued ({count} groups, {len(unames)} users, {min_cd:.0f}-{max_cd:.0f}s cd)",
+            "last_update": datetime.now().strftime("%H:%M:%S"),
+        }
+
+    threading.Thread(target=group_creator_loop, args=(job_id,), daemon=True).start()
+    return {"ok": True, "job_id": job_id, "count": count, "usernames": unames}
+
+
+@app.post("/api/groups/create/{job_id}/stop")
+def api_stop_group_creator(
+    job_id: str,
+    x_panel_token: Optional[str] = Header(default=None),
+    token: Optional[str] = None,
+):
+    verify_auth(x_panel_token, token)
+    set_creator_running(job_id, False)
+    return {"ok": True, "job_id": job_id}
+
+
+@app.post("/api/groups/invite-links")
+def api_group_invite_links(
+    body: InviteLinksReq,
+    x_panel_token: Optional[str] = Header(default=None),
+    token: Optional[str] = None,
+):
+    verify_auth(x_panel_token, token)
+    uname = body.username.strip().lstrip("@")
+    tids = parse_thread_ids(body.thread_ids)
+    if not uname or not tids:
+        raise HTTPException(status_code=400, detail="Select or enter at least 1 valid numeric GC thread ID.")
+
+    try:
+        cl = get_or_resume_client(uname)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    results = []
+    for idx, tid_str in enumerate(tids):
+        results.append(extract_group_invite_link(cl, tid_str))
+        if idx < len(tids) - 1:
+            time.sleep(random.uniform(1.5, 3.0))
+
+    return {"ok": True, "results": results}
+
+
+@app.post("/api/tasks/start")
+def api_start_task(
+    body: StartTaskReq,
+    x_panel_token: Optional[str] = Header(default=None),
+    token: Optional[str] = None,
+):
+    verify_auth(x_panel_token, token)
+    uname = body.username.strip().lstrip("@")
+    target = body.target_name.strip()
+    tids = parse_thread_ids(body.thread_ids)
+    speed = (body.speed_mode or "slow").strip().lower()
+    use_nc = bool(True if body.use_nc is None else body.use_nc)
+    sockets = max(1, min(16, int(body.socket_count if body.socket_count is not None else 1)))
+    if speed not in ("slow", "fast"):
+        raise HTTPException(status_code=400, detail="speed_mode must be 'slow' or 'fast'.")
+
+    if not uname or not target or not tids:
+        raise HTTPException(status_code=400, detail="Username, target name, and at least 1 valid numeric thread ID required.")
+
+    try:
+        cl = get_or_resume_client(uname)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    task_id = f"T{uuid.uuid4().hex[:6].upper()}"
+    with tasks_lock:
+        active_tasks[task_id] = {
+            "client": cl,
+            "username": uname,
+            "thread_ids": tids,
+            "target_name": target,
+            "speed_mode": speed,
+            "use_nc": use_nc,
+            "socket_count": sockets,
+            "running": True,
+            "msg_count": 0,
+            "last_event": f"Queued (NC every 10-20m, {sockets} sock)" if use_nc else f"Queued (Without NC, {sockets} sock)",
+            "last_update": datetime.now().strftime("%H:%M:%S"),
+        }
+
+    threading.Thread(target=worker_loop, args=(task_id,), daemon=True).start()
+    return {"ok": True, "task_id": task_id, "speed_mode": speed, "use_nc": use_nc, "socket_count": sockets, "thread_ids": tids}
+
+
+@app.post("/api/ws-sender/{task_id}/sockets")
+def api_update_ws_sockets(
+    task_id: str,
+    body: UpdateSocketsReq,
+    x_panel_token: Optional[str] = Header(default=None),
+    token: Optional[str] = None,
+):
+    verify_auth(x_panel_token, token)
+    with tasks_lock:
+        if task_id not in active_tasks:
+            raise HTTPException(status_code=404, detail="Task not found.")
+    updated = set_task_socket_count(task_id, body.socket_count)
+    return {"ok": True, "task_id": task_id, "socket_count": updated}
+
+
+@app.post("/api/tasks/{task_id}/stop")
+def api_stop_task(
+    task_id: str,
+    x_panel_token: Optional[str] = Header(default=None),
+    token: Optional[str] = None,
+):
+    verify_auth(x_panel_token, token)
+    set_task_running(task_id, False)
+    return {"ok": True, "task_id": task_id}
+
+
+@app.post("/api/tasks/stop-all")
+def api_stop_all(x_panel_token: Optional[str] = Header(default=None), token: Optional[str] = None):
+    verify_auth(x_panel_token, token)
+    with tasks_lock:
+        for info in active_tasks.values():
+            info["running"] = False
+        for job in group_creator_jobs.values():
+            job["running"] = False
+    return {"ok": True}
+
+
+@app.post("/api/template")
+def api_set_template(
+    body: TemplateReq,
+    x_panel_token: Optional[str] = Header(default=None),
+    token: Optional[str] = None,
+):
+    verify_auth(x_panel_token, token)
+    try:
+        set_active_template(body.template, body.group_title_template)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "ok": True,
+        "template": get_active_single_line_template(),
+        "group_title_template": get_active_group_title_template(),
+    }
+
+
+@app.post("/api/template/reset")
+def api_reset_template(x_panel_token: Optional[str] = Header(default=None), token: Optional[str] = None):
+    verify_auth(x_panel_token, token)
+    reset_active_template()
+    return {
+        "ok": True,
+        "template": get_active_single_line_template(),
+        "group_title_template": get_active_group_title_template(),
+    }
+
+
+# ======================== WEB UI ========================
+
+HTML_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ρ 𝕣 ꪜ 𝕣 अब्बू ☽ · IG Web Controller</title>
+  <style>
+    :root {
+      --bg: #0b0d14;
+      --card: #151923;
+      --border: #272e3f;
+      --text: #eef2ff;
+      --muted: #94a3b8;
+      --accent: #3b82f6;
+      --green: #22c55e;
+      --red: #ef4444;
+      --amber: #f59e0b;
+    }
+    * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
+    body { margin: 0; background: var(--bg); color: var(--text); padding: 20px; }
+    .wrap { max-width: 1120px; margin: 0 auto; display: grid; gap: 16px; }
+
+    @keyframes rgbShift {
+      0% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+    @keyframes pulseGlow {
+      0%, 100% {
+        box-shadow: 0 0 22px rgba(236, 72, 153, 0.35), 0 0 42px rgba(59, 130, 246, 0.25);
+        transform: translateY(0px);
+      }
+      50% {
+        box-shadow: 0 0 30px rgba(34, 211, 238, 0.45), 0 0 54px rgba(168, 85, 247, 0.35);
+        transform: translateY(-1px);
+      }
+    }
+
+    .hero-banner {
+      position: relative;
+      border-radius: 16px;
+      padding: 2px;
+      background: linear-gradient(120deg, #ff2a85, #ff8a00, #ffd600, #00f5a0, #00d9f5, #8b5cf6, #ff2a85);
+      background-size: 300% 300%;
+      animation: rgbShift 6s ease infinite, pulseGlow 3.2s ease-in-out infinite;
+    }
+    .hero-banner-inner {
+      background: radial-gradient(circle at 20% 20%, rgba(236, 72, 153, 0.22), transparent 45%),
+                  radial-gradient(circle at 80% 30%, rgba(34, 211, 238, 0.22), transparent 45%),
+                  radial-gradient(circle at 50% 90%, rgba(168, 85, 247, 0.24), transparent 55%),
+                  #0e111b;
+      border-radius: 14px;
+      padding: 24px 20px;
+      text-align: center;
+    }
+    .hero-banner-text {
+      font-size: clamp(2rem, 5vw, 3.25rem);
+      font-weight: 900;
+      letter-spacing: 0.05em;
+      line-height: 1.2;
+      background: linear-gradient(90deg, #ff4ecd, #ffbe0b, #00f5d4, #4cc9f0, #c77dff, #ff4ecd);
+      background-size: 250% 250%;
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+      animation: rgbShift 5s linear infinite;
+      filter: drop-shadow(0 0 14px rgba(236, 72, 153, 0.35));
+      word-break: break-word;
+    }
+
+    .top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; }
+    .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+    h1, h2, h3 { margin: 0 0 10px; }
+    h1 { font-size: 1.35rem; }
+    h2 { font-size: 1.05rem; }
+    label { display: block; font-size: 0.85rem; color: var(--muted); margin: 10px 0 4px; }
+    input, select, textarea {
+      width: 100%; background: #0d1017; color: var(--text); border: 1px solid var(--border);
+      border-radius: 8px; padding: 9px 11px; font-size: 0.92rem;
+    }
+    button {
+      background: linear-gradient(135deg, #3b82f6, #8b5cf6); color: #fff; border: 0; border-radius: 8px;
+      padding: 8px 12px; font-weight: 600; cursor: pointer; font-size: 0.85rem;
+    }
+    button:hover { opacity: 0.92; }
+    button.secondary { background: #242b3d; color: var(--text); }
+    button.picked { background: linear-gradient(135deg, #ec4899, #8b5cf6); border: 1px solid #f472b6; color: #fff; }
+    button.danger { background: var(--red); }
+    button.warn { background: var(--amber); color: #111; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; align-items: center; }
+    .two-col-inline { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .picker-box { display: flex; flex-direction: column; gap: 6px; max-height: 200px; overflow-y: auto; margin-top: 8px; }
+    .pick-btn { width: 100%; text-align: left; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .tid-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.76rem; opacity: 0.85; word-break: break-all; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.78rem; font-weight: 600; }
+    .on { background: rgba(34,197,94,0.16); color: var(--green); }
+    .off { background: rgba(239,68,68,0.16); color: var(--red); }
+    .speed-badge { background: rgba(59,130,246,0.16); color: #93c5fd; }
+    .nc-badge { background: rgba(245,158,11,0.16); color: #fcd34d; }
+    .muted { color: var(--muted); font-size: 0.85rem; }
+    .list-item { border-top: 1px solid var(--border); padding: 10px 0; display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+    .list-item:first-child { border-top: 0; }
+    .link-box { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; max-height: 200px; overflow-y: auto; }
+    .link-row { background: #0d1017; border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 0.82rem; }
+    details { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 10px; }
+    summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; }
+    .toast { position: fixed; bottom: 18px; right: 18px; background: #1f2937; border: 1px solid var(--border); padding: 10px 14px; border-radius: 8px; display: none; z-index: 50; max-width: 420px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero-banner">
+      <div class="hero-banner-inner">
+        <div class="hero-banner-text">ρ 𝕣 ꪜ 𝕣 अब्बू ☽</div>
+      </div>
+    </div>
+
+    <div class="top">
+      <div>
+        <h1>Instagram Automation Web Panel</h1>
+        <div class="muted" id="statsBar">Loading stats...</div>
+      </div>
+      <div class="row" style="margin:0;">
+        <input id="tokenInput" type="password" placeholder="Panel Token (if set)" style="width:190px;" />
+        <button class="secondary" onclick="saveToken()">Save Token</button>
+        <button class="danger" onclick="stopAll()">Stop All</button>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <h2>1. Login (Username & Password)</h2>
+        <label>Instagram Username</label>
+        <input id="igUser" placeholder="Instagram username" />
+        <label>Instagram Password</label>
+        <input id="igPass" type="password" placeholder="Instagram password" />
+        <div id="tfaBox" style="display:none;">
+          <label>6-Digit 2FA Code</label>
+          <input id="ig2fa" placeholder="6-digit 2FA code" />
+        </div>
+        <div class="row"><button onclick="loginPassword()">Login with Password</button></div>
+
+        <details>
+          <summary>Fallback: Login via Session ID</summary>
+          <label>Session ID Cookie</label>
+          <input id="sidInput" type="password" placeholder="Paste sessionid cookie value" />
+          <div class="row"><button class="secondary" onclick="loginSession()">Login with Session ID</button></div>
+        </details>
+
+        <h3 style="margin-top:16px; font-size:0.95rem;">Saved Accounts</h3>
+        <div id="accountsList" class="muted">None yet.</div>
+      </div>
+
+      <div class="card">
+        <h2>2. Start Task & Group Selector</h2>
+        <label>Account</label>
+        <select id="taskAccount" onchange="syncAccountSelectors(this.value)"></select>
+
+        <div class="row">
+          <button class="secondary" onclick="fetchThreads()">Load Chats / Groups</button>
+          <button class="secondary" onclick="selectAllLoaded(true)">Select All</button>
+          <button class="secondary" onclick="selectAllLoaded(false)">Clear</button>
+          <span class="muted" id="threadStatus"></span>
+        </div>
+
+        <div id="threadPicker" class="picker-box"></div>
+
+        <label>Selected Thread IDs (auto-filled or paste comma-separated IDs)</label>
+        <input id="threadIdsInput" type="text" placeholder="Tap chats above or paste full numeric IDs" />
+
+        <label>Target Name ({TARGET})</label>
+        <input id="targetInput" placeholder="Enter target name" />
+
+        <div class="two-col-inline">
+          <div>
+            <label>Message Speed</label>
+            <select id="speedMode">
+              <option value="slow" selected>Slow (25–45s + spread)</option>
+              <option value="fast">Fast (10–20s delay)</option>
+            </select>
+          </div>
+          <div>
+            <label>Name Change (NC) Mode</label>
+            <select id="ncMode">
+              <option value="true" selected>With NC (every 10–20m)</option>
+              <option value="false">Without NC</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row"><button onclick="startTask()">Start Task</button></div>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <h2>3. Group Chat Creator (With Cooldowns)</h2>
+        <div class="muted">Enter at least <strong>2 usernames</strong>. Resolves usernames to IDs and creates groups with cooldowns.</div>
+        <label>Account</label>
+        <select id="gcCreatorAccount"></select>
+
+        <label>Usernames to Add (comma-separated, at least 2)</label>
+        <input id="gcCreateUsernames" type="text" placeholder="e.g. @user_one, @user_two, user_three" />
+
+        <div class="two-col-inline">
+          <div>
+            <label>Number of Groups to Create</label>
+            <input id="gcCreateCount" type="number" min="1" max="50" value="3" />
+          </div>
+          <div>
+            <label>Target Name ({TARGET})</label>
+            <input id="gcCreateTarget" placeholder="Optional target name" />
+          </div>
+        </div>
+
+        <label>Group Title Template</label>
+        <input id="gcCreateTitle" type="text" placeholder="{TARGET} #{N}" />
+
+        <div class="two-col-inline">
+          <div>
+            <label>Min Cooldown (sec)</label>
+            <input id="gcMinCd" type="number" min="10" value="25" />
+          </div>
+          <div>
+            <label>Max Cooldown (sec)</label>
+            <input id="gcMaxCd" type="number" min="10" value="45" />
+          </div>
+        </div>
+
+        <label>Initial Message After Creation</label>
+        <select id="gcSendPing">
+          <option value="true" selected>Send welcome ping so GC appears in inbox</option>
+          <option value="false">Do not send initial message</option>
+        </select>
+
+        <div class="row">
+          <button onclick="startGroupCreator()">Start Creating Groups</button>
+          <button class="secondary" onclick="useCreatedIdsForTask()">Use Created IDs in Task</button>
+        </div>
+
+        <div id="creatorJobsList" class="muted" style="margin-top:10px;">No group creation jobs yet.</div>
+      </div>
+
+      <div class="card">
+        <h2>4. Mobile Group Invite Link Extractor</h2>
+        <div class="muted">Extracts mobile invite links for the selected/entered group IDs above.</div>
+        <label>Account</label>
+        <select id="inviteAccount"></select>
+
+        <label>Group Thread IDs to Extract (uses Selected Thread IDs if left blank)</label>
+        <input id="inviteThreadIds" type="text" placeholder="Leave blank to use Selected Thread IDs" />
+
+        <div class="row">
+          <button onclick="extractInviteLinks()">Extract Invite Links</button>
+          <button class="secondary" onclick="copyExtractedLinks()">Copy Links</button>
+        </div>
+
+        <div id="inviteLinksResult" class="link-box">
+          <div class="muted">No invite links extracted yet.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <h2>5. WebSocket Multi-Sender (igrapiweb)</h2>
+        <div class="muted">Runs one-by-one across multiple thread IDs. Change sockets anytime—even while a task is running.</div>
+        <div class="row">
+          <label for="wsSocketSelect" style="margin:0;">Sockets:</label>
+          <select id="wsSocketSelect" style="width:90px;">
+            <option value="1" selected>1</option>
+            <option value="2">2</option>
+            <option value="3">3</option>
+            <option value="4">4</option>
+            <option value="5">5</option>
+            <option value="6">6</option>
+            <option value="8">8</option>
+            <option value="10">10</option>
+          </select>
+          <button class="secondary" onclick="applyLiveSockets()">Update Active Sockets</button>
+        </div>
+        <div id="tasksList" class="muted" style="margin-top:10px;">No tasks yet.</div>
+      </div>
+
+      <div class="card">
+        <h2>6. Message & Group Rename Templates</h2>
+        <div class="muted">Enter <strong>one line</strong> using <code>{TARGET}</code>. Picks a random emoji for <code>-🌒-</code> on each of the 11 lines.</div>
+        <label>Single Line Message Template</label>
+        <input id="templateLineInput" type="text" placeholder="<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> -🌒-" />
+
+        <label>Group Name Template (when NC is ON, uses <code>{TARGET}</code>)</label>
+        <input id="groupTitleInput" type="text" placeholder="{TARGET}" />
+
+        <div class="row">
+          <button onclick="saveTemplate()">Save Templates</button>
+          <button class="warn" onclick="resetTemplate()">Reset Defaults</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const TOKEN_KEY = "ig_panel_token";
+    document.getElementById("tokenInput").value = localStorage.getItem(TOKEN_KEY) || "";
+    let loadedThreads = [];
+    let latestCreatedIds = [];
+    let latestExtractedLinks = [];
+    let latestTasks = [];
+
+    function showToast(msg, err = false) {
+      const el = document.getElementById("toast");
+      el.textContent = msg;
+      el.style.borderColor = err ? "#ef4444" : "#22c55e";
+      el.style.display = "block";
+      clearTimeout(window._t);
+      window._t = setTimeout(() => { el.style.display = "none"; }, 4500);
+    }
+
+    function saveToken() {
+      localStorage.setItem(TOKEN_KEY, document.getElementById("tokenInput").value.trim());
+      showToast("Token saved");
+      refreshState();
+    }
+
+    async function api(path, method = "GET", body = null) {
+      const tok = localStorage.getItem(TOKEN_KEY) || "";
+      const headers = { "Content-Type": "application/json" };
+      if (tok) headers["X-Panel-Token"] = tok;
+      const res = await fetch(path, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : null,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok && res.status !== 202) {
+        throw new Error(data.detail || `Request failed (${res.status})`);
+      }
+      return { status: res.status, data };
+    }
+
+    function syncAccountSelectors(val) {
+      if (!val) return;
+      for (const id of ["taskAccount", "gcCreatorAccount", "inviteAccount"]) {
+        const el = document.getElementById(id);
+        if (el && Array.from(el.options).some(o => o.value === val)) {
+          el.value = val;
+        }
+      }
+    }
+
+    function parseThreadStringList(rawStr) {
+      return String(rawStr || "")
+        .split(",")
+        .map(s => s.trim())
+        .filter(s => /^\d+$/.test(s));
+    }
+
+    function getSelectedThreadStrings() {
+      return parseThreadStringList(document.getElementById("threadIdsInput").value);
+    }
+
+    function renderThreadPicker() {
+      const selected = new Set(getSelectedThreadStrings());
+      const picker = document.getElementById("threadPicker");
+      if (!loadedThreads.length) {
+        picker.innerHTML = "";
+        return;
+      }
+      picker.innerHTML = loadedThreads.map(t => {
+        const idStr = String(t.id);
+        const isPicked = selected.has(idStr);
+        return `<button type="button" class="pick-btn ${isPicked ? "picked" : "secondary"}" onclick="toggleThreadId('${idStr}')">
+          <span>${isPicked ? "✅" : "⬜"} ${escapeHtml(t.label)}</span>
+          <span class="tid-mono">${escapeHtml(idStr)}</span>
+        </button>`;
+      }).join("");
+    }
+
+    function escapeHtml(s) {
+      return String(s || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function toggleThreadId(idStr) {
+      const cleanId = String(idStr).trim();
+      const input = document.getElementById("threadIdsInput");
+      const list = getSelectedThreadStrings();
+      const idx = list.indexOf(cleanId);
+      if (idx >= 0) list.splice(idx, 1);
+      else list.push(cleanId);
+      input.value = list.join(", ");
+      renderThreadPicker();
+    }
+
+    function selectAllLoaded(selectAll) {
+      if (!loadedThreads.length) return showToast("Load chats/groups first", true);
+      document.getElementById("threadIdsInput").value = selectAll
+        ? loadedThreads.map(t => String(t.id).trim()).filter(s => /^\d+$/.test(s)).join(", ")
+        : "";
+      renderThreadPicker();
+    }
+
+    async function setTaskSockets(taskId, sockets) {
+      try {
+        const sc = parseInt(sockets, 10) || 1;
+        const { data } = await api(`/api/ws-sender/${encodeURIComponent(taskId)}/sockets`, "POST", { socket_count: sc });
+        showToast(`${taskId}: sockets set to ${data.socket_count}`);
+        refreshState();
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function applyLiveSockets() {
+      const sc = parseInt(document.getElementById("wsSocketSelect").value, 10) || 1;
+      const running = latestTasks.filter(t => t.running);
+      if (!running.length) return showToast(`Default sockets set to ${sc}`);
+      for (const t of running) {
+        await setTaskSockets(t.task_id, sc);
+      }
+    }
+
+    async function refreshState() {
+      try {
+        const { data } = await api("/api/state");
+        const s = data.stats;
+        document.getElementById("statsBar").textContent =
+          `CPU ${s.cpu_percent}% · RAM ${s.ram_percent}% (${s.ram_used_gb}/${s.ram_total_gb} GB) · RSS ${s.rss_mb} MB · Sent ${data.global_messages_sent} · Uptime ${data.uptime}`;
+
+        const accs = Object.keys(data.accounts || {});
+        for (const id of ["taskAccount", "gcCreatorAccount", "inviteAccount"]) {
+          const sel = document.getElementById(id);
+          const prev = sel.value;
+          sel.innerHTML = accs.map(u => `<option value="${escapeHtml(u)}">@${escapeHtml(u)}</option>`).join("");
+          if (accs.includes(prev)) sel.value = prev;
+        }
+
+        const accBox = document.getElementById("accountsList");
+        if (!accs.length) {
+          accBox.innerHTML = `<div class="muted">No saved accounts yet.</div>`;
+        } else {
+          accBox.innerHTML = accs.map(u => {
+            const m = data.accounts[u];
+            return `<div class="list-item">
+              <div><strong>@${escapeHtml(u)}</strong> <span class="muted">(${escapeHtml(m.auth_method || "saved")})</span></div>
+              <button class="secondary" onclick="deleteAccount('${escapeHtml(u)}')">Remove</button>
+            </div>`;
+          }).join("");
+        }
+
+        const tBox = document.getElementById("tasksList");
+        latestTasks = Array.isArray(data.tasks) ? data.tasks : [];
+        if (!latestTasks.length) {
+          tBox.innerHTML = `<div class="muted">No tasks created yet.</div>`;
+        } else {
+          tBox.innerHTML = latestTasks.map(t => {
+            const sc = parseInt(t.socket_count || 1, 10);
+            return `
+            <div class="list-item">
+              <div>
+                <div><strong>${escapeHtml(t.task_id)}</strong> · @${escapeHtml(t.username)} → <strong>${escapeHtml(t.target_name)}</strong>
+                  <span class="badge ${t.running ? "on" : "off"}">${t.running ? "RUNNING" : "STOPPED"}</span>
+                  <span class="badge speed-badge">${escapeHtml((t.speed_mode || "slow").toUpperCase())}</span>
+                  <span class="badge nc-badge">${t.use_nc !== false ? "WITH NC" : "NO NC"}</span>
+                  <span class="badge speed-badge">SOCK: ${sc}</span>
+                </div>
+                <div class="muted">Sent: ${t.msg_count} · ${escapeHtml(t.last_event || "Idle")} (${escapeHtml(t.last_update || "")})</div>
+                <div class="row" style="margin-top:6px;">
+                  <label style="margin:0; font-size:0.78rem;">Live Sockets:</label>
+                  <select style="width:74px; padding:4px 6px; font-size:0.8rem;" onchange="setTaskSockets('${escapeHtml(t.task_id)}', this.value)">
+                    ${[1,2,3,4,5,6,8,10].map(n => `<option value="${n}" ${sc === n ? "selected" : ""}>${n}</option>`).join("")}
+                  </select>
+                </div>
+              </div>
+              ${t.running ? `<button class="danger" onclick="stopTask('${escapeHtml(t.task_id)}')">Stop</button>` : ""}
+            </div>
+          `;
+          }).join("");
+        }
+
+        const cBox = document.getElementById("creatorJobsList");
+        const jobs = data.group_creator_jobs || [];
+        if (!jobs.length) {
+          cBox.innerHTML = `<div class="muted">No group creation jobs yet.</div>`;
+        } else {
+          const allIds = [];
+          for (const j of jobs) {
+            for (const cid of (j.created_ids || [])) {
+              if (!allIds.includes(String(cid))) allIds.push(String(cid));
+            }
+          }
+          latestCreatedIds = allIds;
+
+          cBox.innerHTML = jobs.map(j => `
+            <div class="list-item">
+              <div>
+                <div><strong>${escapeHtml(j.job_id)}</strong> · @${escapeHtml(j.username)} · <strong>${j.created_count}/${j.count}</strong> created
+                  <span class="badge ${j.running ? "on" : "off"}">${j.running ? "CREATING" : "DONE"}</span>
+                </div>
+                <div class="muted">${escapeHtml(j.last_event || "")} (${escapeHtml(j.last_update || "")})</div>
+                ${(j.created_ids && j.created_ids.length)
+                  ? `<div class="tid-mono" style="margin-top:4px;">IDs: ${escapeHtml(j.created_ids.join(", "))}</div>`
+                  : ""}
+              </div>
+              ${j.running ? `<button class="danger" onclick="stopGroupCreator('${escapeHtml(j.job_id)}')">Stop</button>` : ""}
+            </div>
+          `).join("");
+        }
+
+        const tplEl = document.getElementById("templateLineInput");
+        if (document.activeElement !== tplEl) {
+          tplEl.value = data.template || "";
+        }
+        const gtEl = document.getElementById("groupTitleInput");
+        if (document.activeElement !== gtEl) {
+          gtEl.value = data.group_title_template || "{TARGET}";
+        }
+      } catch (e) {
+        document.getElementById("statsBar").textContent = e.message;
+      }
+    }
+
+    async function loginSession() {
+      try {
+        const sid = document.getElementById("sidInput").value.trim();
+        const { data } = await api("/api/login/session", "POST", { session_id: sid });
+        document.getElementById("sidInput").value = "";
+        showToast(`Logged in as @${data.username}`);
+        refreshState();
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function loginPassword() {
+      try {
+        const username = document.getElementById("igUser").value.trim();
+        const password = document.getElementById("igPass").value;
+        const two_factor_code = document.getElementById("ig2fa").value.trim() || null;
+        const { status, data } = await api("/api/login/password", "POST", { username, password, two_factor_code });
+        if (status === 202 && data.two_factor_required) {
+          document.getElementById("tfaBox").style.display = "block";
+          showToast("2FA code required—enter it and click again", true);
+          return;
+        }
+        document.getElementById("igPass").value = "";
+        document.getElementById("ig2fa").value = "";
+        document.getElementById("tfaBox").style.display = "none";
+        showToast(`Logged in as @${data.username}`);
+        refreshState();
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function deleteAccount(u) {
+      try {
+        await api(`/api/accounts/${encodeURIComponent(u)}`, "DELETE");
+        showToast(`Removed @${u}`);
+        refreshState();
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function fetchThreads() {
+      const u = document.getElementById("taskAccount").value;
+      if (!u) return showToast("Select an account first", true);
+      document.getElementById("threadStatus").textContent = "Loading...";
+      try {
+        const { data } = await api(`/api/threads/${encodeURIComponent(u)}`);
+        loadedThreads = Array.isArray(data.threads) ? data.threads : [];
+        renderThreadPicker();
+        document.getElementById("threadStatus").textContent = `${loadedThreads.length} loaded`;
+      } catch (e) {
+        document.getElementById("threadStatus").textContent = "";
+        showToast(e.message, true);
+      }
+    }
+
+    async function startTask() {
+      try {
+        const username = document.getElementById("taskAccount").value;
+        const target_name = document.getElementById("targetInput").value.trim();
+        const speed_mode = document.getElementById("speedMode").value;
+        const use_nc = document.getElementById("ncMode").value === "true";
+        const socket_count = parseInt(document.getElementById("wsSocketSelect").value, 10) || 1;
+        const thread_ids = getSelectedThreadStrings();
+        const { data } = await api("/api/tasks/start", "POST", { username, thread_ids, target_name, speed_mode, use_nc, socket_count });
+        showToast(`Started task ${data.task_id} (${data.speed_mode}, ${data.use_nc ? "with NC" : "no NC"}, ${data.socket_count} sock)`);
+        refreshState();
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function startGroupCreator() {
+      try {
+        const username = document.getElementById("gcCreatorAccount").value;
+        const count = parseInt(document.getElementById("gcCreateCount").value, 10) || 1;
+        const target_name = document.getElementById("gcCreateTarget").value.trim() || document.getElementById("targetInput").value.trim();
+        const title_template = document.getElementById("gcCreateTitle").value.trim() || null;
+        const usernames = document.getElementById("gcCreateUsernames").value
+          .split(",").map(s => s.trim().replace(/^@+/, "")).filter(Boolean);
+        const min_cooldown = parseFloat(document.getElementById("gcMinCd").value) || 25;
+        const max_cooldown = parseFloat(document.getElementById("gcMaxCd").value) || 45;
+        const send_ping = document.getElementById("gcSendPing").value === "true";
+
+        const { data } = await api("/api/groups/create", "POST", {
+          username, count, title_template, target_name, usernames, min_cooldown, max_cooldown, send_ping
+        });
+        showToast(`Started group creator ${data.job_id} (${data.count} groups)`);
+        refreshState();
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function stopGroupCreator(jobId) {
+      try {
+        await api(`/api/groups/create/${encodeURIComponent(jobId)}/stop`, "POST");
+        showToast(`Stopped creator ${jobId}`);
+        refreshState();
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    function useCreatedIdsForTask() {
+      if (!latestCreatedIds.length) return showToast("No created group IDs yet", true);
+      document.getElementById("threadIdsInput").value = latestCreatedIds.join(", ");
+      renderThreadPicker();
+      showToast(`Loaded ${latestCreatedIds.length} created group IDs`);
+    }
+
+    async function extractInviteLinks() {
+      try {
+        const username = document.getElementById("inviteAccount").value;
+        const customRaw = document.getElementById("inviteThreadIds").value.trim();
+        const thread_ids = customRaw ? parseThreadStringList(customRaw) : getSelectedThreadStrings();
+        if (!thread_ids.length) {
+          return showToast("Select or enter at least 1 valid group ID first", true);
+        }
+
+        const resBox = document.getElementById("inviteLinksResult");
+        resBox.innerHTML = `<div class="muted">Extracting links for ${thread_ids.length} thread(s)...</div>`;
+
+        const { data } = await api("/api/groups/invite-links", "POST", { username, thread_ids });
+        latestExtractedLinks = Array.isArray(data.results) ? data.results : [];
+
+        resBox.innerHTML = latestExtractedLinks.map(r => {
+          if (r.invite_link) {
+            return `<div class="link-row">
+              <div><strong>${escapeHtml(r.title)}</strong> <span class="tid-mono">(${escapeHtml(r.thread_id)})</span></div>
+              <div class="tid-mono" style="margin-top:4px; color:#6ee7b7;">${escapeHtml(r.invite_link)}</div>
+            </div>`;
+          }
+          return `<div class="link-row">
+            <div><strong>${escapeHtml(r.title)}</strong> <span class="tid-mono">(${escapeHtml(r.thread_id)})</span></div>
+            <div class="muted" style="margin-top:3px;">${escapeHtml(r.status || "No link returned")}</div>
+          </div>`;
+        }).join("");
+
+        const okCount = latestExtractedLinks.filter(x => x.invite_link).length;
+        showToast(`Extracted ${okCount}/${latestExtractedLinks.length} invite links`);
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function copyExtractedLinks() {
+      const links = latestExtractedLinks.map(x => x.invite_link).filter(Boolean);
+      if (!links.length) return showToast("No extracted invite links to copy", true);
+      try {
+        await navigator.clipboard.writeText(links.join("\\n"));
+        showToast(`Copied ${links.length} invite link(s)`);
+      } catch (_) {
+        showToast("Clipboard blocked—copy directly from the list above", true);
+      }
+    }
+
+    async function stopTask(id) {
+      try {
+        await api(`/api/tasks/${encodeURIComponent(id)}/stop`, "POST");
+        showToast(`Stopped ${id}`);
+        refreshState();
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function stopAll() {
+      try {
+        await api("/api/tasks/stop-all", "POST");
+        showToast("Stopped all tasks & creators");
+        refreshState();
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function saveTemplate() {
+      try {
+        const template = document.getElementById("templateLineInput").value;
+        const group_title_template = document.getElementById("groupTitleInput").value;
+        const { data } = await api("/api/template", "POST", { template, group_title_template });
+        document.getElementById("templateLineInput").value = data.template || template;
+        document.getElementById("groupTitleInput").value = data.group_title_template || "{TARGET}";
+        showToast("Templates saved");
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function resetTemplate() {
+      try {
+        const { data } = await api("/api/template/reset", "POST");
+        document.getElementById("templateLineInput").value = data.template || "";
+        document.getElementById("groupTitleInput").value = data.group_title_template || "{TARGET}";
+        showToast("Templates reset to defaults");
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    document.getElementById("threadIdsInput").addEventListener("input", renderThreadPicker);
+    refreshState();
+    setInterval(refreshState, 4000);
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def index(request: Request):
+    return HTMLResponse(content=HTML_PAGE)
+
+
+if __name__ == "__main__":
+    print(f"🌐 Web panel listening on 0.0.0.0:{PORT} (DATA_DIR={DATA_DIR})", flush=True)
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
