@@ -47,10 +47,6 @@ EMOJI_POOL = [
     "❄️", "☔", "🌈", "🔥", "💀", "🤡", "😈", "👻",
 ]
 
-SUBTLE_LINK_SLUGS = [
-    "r", "x", "q", "v", "k", "m", "n", "t",
-]
-
 MAX_RETRIES = 5
 
 active_tasks: dict = {}
@@ -215,12 +211,6 @@ def build_expanded_message(single_line_template: str, target_name: str) -> str:
         if idx < len(LINE_GAPS_AFTER) - 1:
             parts.append("\n" * newlines_after)
     return "".join(parts)
-
-
-def make_subtle_z_link() -> str:
-    slug = random.choice(SUBTLE_LINK_SLUGS)
-    suffix = uuid.uuid4().hex[:3]
-    return f"https://z.in/{slug}{suffix}"
 
 
 # ======================== IG HELPERS ========================
@@ -583,21 +573,6 @@ def set_task_running(task_id: str, running: bool):
             active_tasks[task_id]["running"] = running
 
 
-def get_task_socket_count(task_id: str) -> int:
-    with tasks_lock:
-        return max(1, min(16, int(active_tasks.get(task_id, {}).get("socket_count", 1) or 1)))
-
-
-def set_task_socket_count(task_id: str, sockets: int) -> int:
-    clamped = max(1, min(16, int(sockets)))
-    with tasks_lock:
-        if task_id in active_tasks:
-            active_tasks[task_id]["socket_count"] = clamped
-            active_tasks[task_id]["last_event"] = f"Sockets updated to {clamped}"
-            active_tasks[task_id]["last_update"] = datetime.now().strftime("%H:%M:%S")
-    return clamped
-
-
 def log_task(task_id: str, msg: str):
     with tasks_lock:
         task = active_tasks.get(task_id)
@@ -620,20 +595,12 @@ def next_delay(speed_mode: str, slow_band: tuple[float, float]) -> float:
     return random.uniform(slow_band[0], slow_band[1])
 
 
-def _sleep_interruptible(task_id: str, seconds: float):
-    slept = 0.0
-    while slept < seconds and is_task_running(task_id):
-        step = min(1.0, seconds - slept)
-        time.sleep(step)
-        slept += step
-
-
 def apply_group_names_once(task_id: str, cl: Client, thread_ids: list[str], target_name: str):
     title_tpl = get_active_group_title_template()
     new_title = title_tpl.replace("{TARGET}", target_name).strip()[:75]
     if not new_title:
         return
-    for idx, tid_str in enumerate(thread_ids):
+    for tid_str in thread_ids:
         if not is_task_running(task_id):
             break
         try:
@@ -641,30 +608,24 @@ def apply_group_names_once(task_id: str, cl: Client, thread_ids: list[str], targ
             log_task(task_id, f"NC updated {tid_str} -> {new_title[:28]}")
         except Exception as exc:
             log_task(task_id, f"NC skip/err {tid_str}: {str(exc)[:35]}")
-        if idx < len(thread_ids) - 1 and is_task_running(task_id):
-            _sleep_interruptible(task_id, random.uniform(4.0, 8.0))
 
 
 def group_rename_loop(task_id: str, cl: Client, thread_ids: list[str], target_name: str):
-    """Changes group name one-by-one every 10-20 minutes (600-1200s) without instant multi-thread burst."""
+    """Changes group name immediately on start, then every 10-20 minutes (600-1200s)."""
+    apply_group_names_once(task_id, cl, thread_ids, target_name)
+
     while is_task_running(task_id):
         interval = random.uniform(600, 1200)
-        _sleep_interruptible(task_id, interval)
+        slept = 0.0
+        while slept < interval and is_task_running(task_id):
+            step = min(1.0, interval - slept)
+            time.sleep(step)
+            slept += step
 
         if not is_task_running(task_id):
             break
 
         apply_group_names_once(task_id, cl, thread_ids, target_name)
-
-
-def build_outgoing_payload(single_line_tpl: str, target_name: str) -> str:
-    expanded_msg = build_expanded_message(single_line_tpl, target_name)
-    subtle_link = make_subtle_z_link()
-    return (
-        f"{subtle_link}\n\n{expanded_msg}"
-        if random.choice([True, False])
-        else f"{expanded_msg}\n\n{subtle_link}"
-    )
 
 
 def worker_loop(task_id: str):
@@ -697,50 +658,48 @@ def worker_loop(task_id: str):
     while is_task_running(task_id):
         try:
             round_num += 1
-            sockets_now = get_task_socket_count(task_id)
             nc_label = "NC:ON" if use_nc else "NC:OFF"
-            log_task(task_id, f"Round {round_num} started ({speed_mode}, {nc_label}, sock:{sockets_now})")
+            log_task(task_id, f"Round {round_num} started ({speed_mode}, {nc_label})")
             for tid_str in thread_ids:
                 if not is_task_running(task_id):
                     break
 
-                active_sockets = get_task_socket_count(task_id)
+                expanded_msg = build_expanded_message(single_line_tpl, target_name)
+                num = random.randint(1, 10**10)
+                payload = (
+                    f"{num}\n\n{expanded_msg}"
+                    if random.choice([True, False])
+                    else f"{expanded_msg}\n\n{num}"
+                )
+
                 sent = False
-                for sock_idx in range(1, active_sockets + 1):
+                for attempt in range(1, MAX_RETRIES + 1):
                     if not is_task_running(task_id):
                         break
-                    payload = build_outgoing_payload(single_line_tpl, target_name)
-                    sock_sent = False
-                    for attempt in range(1, MAX_RETRIES + 1):
-                        if not is_task_running(task_id):
-                            break
-                        try:
-                            cl.direct_send(payload, thread_ids=[int(tid_str)])
-                            with tasks_lock:
-                                GLOBAL_MESSAGES_SENT += 1
-                                if task_id in active_tasks:
-                                    active_tasks[task_id]["msg_count"] += 1
-                            log_task(task_id, f"Sent to {tid_str} [s{sock_idx}/{active_sockets}]")
-                            sock_sent = True
-                            sent = True
-                            break
-                        except Exception as exc:
-                            wait = 30 * attempt
-                            log_task(task_id, f"Retry {attempt}/{MAX_RETRIES} ({str(exc)[:35]}) in {wait}s")
-                            _sleep_interruptible(task_id, wait)
-
-                    if not sock_sent and is_task_running(task_id):
-                        log_task(task_id, f"Socket {sock_idx}/{active_sockets} failed on {tid_str}")
-
-                    if sock_idx < active_sockets and is_task_running(task_id):
-                        _sleep_interruptible(task_id, random.uniform(1.5, 3.0))
+                    try:
+                        cl.direct_send(payload, thread_ids=[int(tid_str)])
+                        with tasks_lock:
+                            GLOBAL_MESSAGES_SENT += 1
+                            if task_id in active_tasks:
+                                active_tasks[task_id]["msg_count"] += 1
+                        log_task(task_id, f"Sent to {tid_str}")
+                        sent = True
+                        break
+                    except Exception as exc:
+                        wait = 30 * attempt
+                        log_task(task_id, f"Retry {attempt}/{MAX_RETRIES} ({str(exc)[:35]}) in {wait}s")
+                        time.sleep(wait)
 
                 if not sent and is_task_running(task_id):
                     log_task(task_id, f"Skipped thread {tid_str} after retries")
 
                 delay = next_delay(speed_mode, slow_band)
                 log_task(task_id, f"Cooldown {delay:.1f}s ({speed_mode})")
-                _sleep_interruptible(task_id, delay)
+                slept = 0.0
+                while slept < delay and is_task_running(task_id):
+                    step = min(1.0, delay - slept)
+                    time.sleep(step)
+                    slept += step
 
                 if speed_mode == "slow" and (time.time() - last_band_change >= band_interval):
                     slow_band = generate_slow_band()
@@ -748,7 +707,7 @@ def worker_loop(task_id: str):
                     band_interval = random.uniform(3600, 7200)
         except Exception as exc:
             log_task(task_id, f"Loop error: {str(exc)[:40]} (resting 60s)")
-            _sleep_interruptible(task_id, 60)
+            time.sleep(60)
 
     log_task(task_id, "Stopped")
 
@@ -771,11 +730,6 @@ class StartTaskReq(BaseModel):
     target_name: str
     speed_mode: Optional[str] = "slow"
     use_nc: Optional[bool] = True
-    socket_count: Optional[int] = 1
-
-
-class UpdateSocketsReq(BaseModel):
-    socket_count: int
 
 
 class TemplateReq(BaseModel):
@@ -817,7 +771,6 @@ def api_state(x_panel_token: Optional[str] = Header(default=None), token: Option
                 "thread_ids": [str(x) for x in info.get("thread_ids", [])],
                 "speed_mode": info.get("speed_mode", "slow"),
                 "use_nc": bool(info.get("use_nc", True)),
-                "socket_count": int(info.get("socket_count", 1) or 1),
                 "running": info.get("running"),
                 "msg_count": info.get("msg_count", 0),
                 "last_event": info.get("last_event", ""),
@@ -1059,7 +1012,6 @@ def api_start_task(
     tids = parse_thread_ids(body.thread_ids)
     speed = (body.speed_mode or "slow").strip().lower()
     use_nc = bool(True if body.use_nc is None else body.use_nc)
-    sockets = max(1, min(16, int(body.socket_count if body.socket_count is not None else 1)))
     if speed not in ("slow", "fast"):
         raise HTTPException(status_code=400, detail="speed_mode must be 'slow' or 'fast'.")
 
@@ -1080,30 +1032,14 @@ def api_start_task(
             "target_name": target,
             "speed_mode": speed,
             "use_nc": use_nc,
-            "socket_count": sockets,
             "running": True,
             "msg_count": 0,
-            "last_event": f"Queued (NC every 10-20m, {sockets} sock)" if use_nc else f"Queued (Without NC, {sockets} sock)",
+            "last_event": "Queued (NC immediate + 10-20m)" if use_nc else "Queued (Without NC)",
             "last_update": datetime.now().strftime("%H:%M:%S"),
         }
 
     threading.Thread(target=worker_loop, args=(task_id,), daemon=True).start()
-    return {"ok": True, "task_id": task_id, "speed_mode": speed, "use_nc": use_nc, "socket_count": sockets, "thread_ids": tids}
-
-
-@app.post("/api/ws-sender/{task_id}/sockets")
-def api_update_ws_sockets(
-    task_id: str,
-    body: UpdateSocketsReq,
-    x_panel_token: Optional[str] = Header(default=None),
-    token: Optional[str] = None,
-):
-    verify_auth(x_panel_token, token)
-    with tasks_lock:
-        if task_id not in active_tasks:
-            raise HTTPException(status_code=404, detail="Task not found.")
-    updated = set_task_socket_count(task_id, body.socket_count)
-    return {"ok": True, "task_id": task_id, "socket_count": updated}
+    return {"ok": True, "task_id": task_id, "speed_mode": speed, "use_nc": use_nc, "thread_ids": tids}
 
 
 @app.post("/api/tasks/{task_id}/stop")
@@ -1344,7 +1280,7 @@ HTML_PAGE = """<!DOCTYPE html>
           <div>
             <label>Name Change (NC) Mode</label>
             <select id="ncMode">
-              <option value="true" selected>With NC (every 10–20m)</option>
+              <option value="true" selected>With NC (instant + 10–20m)</option>
               <option value="false">Without NC</option>
             </select>
           </div>
@@ -1425,23 +1361,8 @@ HTML_PAGE = """<!DOCTYPE html>
 
     <div class="grid-2">
       <div class="card">
-        <h2>5. WebSocket Multi-Sender (igrapiweb)</h2>
-        <div class="muted">Runs one-by-one across multiple thread IDs. Change sockets anytime—even while a task is running.</div>
-        <div class="row">
-          <label for="wsSocketSelect" style="margin:0;">Sockets:</label>
-          <select id="wsSocketSelect" style="width:90px;">
-            <option value="1" selected>1</option>
-            <option value="2">2</option>
-            <option value="3">3</option>
-            <option value="4">4</option>
-            <option value="5">5</option>
-            <option value="6">6</option>
-            <option value="8">8</option>
-            <option value="10">10</option>
-          </select>
-          <button class="secondary" onclick="applyLiveSockets()">Update Active Sockets</button>
-        </div>
-        <div id="tasksList" class="muted" style="margin-top:10px;">No tasks yet.</div>
+        <h2>5. Active Tasks</h2>
+        <div id="tasksList" class="muted">No tasks yet.</div>
       </div>
 
       <div class="card">
@@ -1469,7 +1390,6 @@ HTML_PAGE = """<!DOCTYPE html>
     let loadedThreads = [];
     let latestCreatedIds = [];
     let latestExtractedLinks = [];
-    let latestTasks = [];
 
     function showToast(msg, err = false) {
       const el = document.getElementById("toast");
@@ -1568,24 +1488,6 @@ HTML_PAGE = """<!DOCTYPE html>
       renderThreadPicker();
     }
 
-    async function setTaskSockets(taskId, sockets) {
-      try {
-        const sc = parseInt(sockets, 10) || 1;
-        const { data } = await api(`/api/ws-sender/${encodeURIComponent(taskId)}/sockets`, "POST", { socket_count: sc });
-        showToast(`${taskId}: sockets set to ${data.socket_count}`);
-        refreshState();
-      } catch (e) { showToast(e.message, true); }
-    }
-
-    async function applyLiveSockets() {
-      const sc = parseInt(document.getElementById("wsSocketSelect").value, 10) || 1;
-      const running = latestTasks.filter(t => t.running);
-      if (!running.length) return showToast(`Default sockets set to ${sc}`);
-      for (const t of running) {
-        await setTaskSockets(t.task_id, sc);
-      }
-    }
-
     async function refreshState() {
       try {
         const { data } = await api("/api/state");
@@ -1615,33 +1517,22 @@ HTML_PAGE = """<!DOCTYPE html>
         }
 
         const tBox = document.getElementById("tasksList");
-        latestTasks = Array.isArray(data.tasks) ? data.tasks : [];
-        if (!latestTasks.length) {
+        if (!data.tasks || !data.tasks.length) {
           tBox.innerHTML = `<div class="muted">No tasks created yet.</div>`;
         } else {
-          tBox.innerHTML = latestTasks.map(t => {
-            const sc = parseInt(t.socket_count || 1, 10);
-            return `
+          tBox.innerHTML = data.tasks.map(t => `
             <div class="list-item">
               <div>
                 <div><strong>${escapeHtml(t.task_id)}</strong> · @${escapeHtml(t.username)} → <strong>${escapeHtml(t.target_name)}</strong>
                   <span class="badge ${t.running ? "on" : "off"}">${t.running ? "RUNNING" : "STOPPED"}</span>
                   <span class="badge speed-badge">${escapeHtml((t.speed_mode || "slow").toUpperCase())}</span>
                   <span class="badge nc-badge">${t.use_nc !== false ? "WITH NC" : "NO NC"}</span>
-                  <span class="badge speed-badge">SOCK: ${sc}</span>
                 </div>
                 <div class="muted">Sent: ${t.msg_count} · ${escapeHtml(t.last_event || "Idle")} (${escapeHtml(t.last_update || "")})</div>
-                <div class="row" style="margin-top:6px;">
-                  <label style="margin:0; font-size:0.78rem;">Live Sockets:</label>
-                  <select style="width:74px; padding:4px 6px; font-size:0.8rem;" onchange="setTaskSockets('${escapeHtml(t.task_id)}', this.value)">
-                    ${[1,2,3,4,5,6,8,10].map(n => `<option value="${n}" ${sc === n ? "selected" : ""}>${n}</option>`).join("")}
-                  </select>
-                </div>
               </div>
               ${t.running ? `<button class="danger" onclick="stopTask('${escapeHtml(t.task_id)}')">Stop</button>` : ""}
             </div>
-          `;
-          }).join("");
+          `).join("");
         }
 
         const cBox = document.getElementById("creatorJobsList");
@@ -1744,10 +1635,9 @@ HTML_PAGE = """<!DOCTYPE html>
         const target_name = document.getElementById("targetInput").value.trim();
         const speed_mode = document.getElementById("speedMode").value;
         const use_nc = document.getElementById("ncMode").value === "true";
-        const socket_count = parseInt(document.getElementById("wsSocketSelect").value, 10) || 1;
         const thread_ids = getSelectedThreadStrings();
-        const { data } = await api("/api/tasks/start", "POST", { username, thread_ids, target_name, speed_mode, use_nc, socket_count });
-        showToast(`Started task ${data.task_id} (${data.speed_mode}, ${data.use_nc ? "with NC" : "no NC"}, ${data.socket_count} sock)`);
+        const { data } = await api("/api/tasks/start", "POST", { username, thread_ids, target_name, speed_mode, use_nc });
+        showToast(`Started task ${data.task_id} (${data.speed_mode}, ${data.use_nc ? "with NC" : "no NC"})`);
         refreshState();
       } catch (e) { showToast(e.message, true); }
     }
